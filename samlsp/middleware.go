@@ -3,6 +3,7 @@ package samlsp
 import (
 	"bytes"
 	"encoding/xml"
+	"errors"
 	"net/http"
 
 	"github.com/crewjam/saml"
@@ -83,7 +84,7 @@ func (m *Middleware) ServeACS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	possibleRequestIDs := []string{}
+	var possibleRequestIDs []string
 	if m.ServiceProvider.AllowIDPInitiated {
 		possibleRequestIDs = append(possibleRequestIDs, "")
 	}
@@ -114,13 +115,31 @@ func (m *Middleware) RequireAccount(handler http.Handler) http.Handler {
 			handler.ServeHTTP(w, r)
 			return
 		}
-		if err == ErrNoSession {
+		if errors.Is(err, ErrNoSession) {
 			m.HandleStartAuthFlow(w, r)
 			return
 		}
 
 		m.OnError(w, r, err)
 	})
+}
+
+func (m *Middleware) postHeader(w http.ResponseWriter) {
+	w.Header().Add("Content-Security-Policy", "default-src; "+
+		"script-src 'sha256-AjPdJSbZmeWHnEc5ykvJFay8FTWeTeRbs9dutfZ0HqE='; "+
+		"reflected-xss block; referrer no-referrer;")
+	w.Header().Add("Content-type", "text/html")
+}
+
+func (m *Middleware) postBody(w http.ResponseWriter, data []byte) {
+	var buf bytes.Buffer
+	buf.WriteString(`<!DOCTYPE html><html><body>`)
+	buf.Write(data)
+	buf.WriteString(`</body></html>`)
+	if _, err := w.Write(buf.Bytes()); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 }
 
 // HandleStartAuthFlow is called to start the SAML authentication process.
@@ -153,9 +172,9 @@ func (m *Middleware) HandleStartAuthFlow(w http.ResponseWriter, r *http.Request)
 	}
 
 	// relayState is limited to 80 bytes but also must be integrity protected.
-	// this means that we cannot use a JWT because it is way to long. Instead
-	// we set a signed cookie that encodes the original URL which we'll check
-	// against the SAML response when we get it.
+	// this means that we cannot use a JWT because it is way too long. we set
+	// a signed cookie that encodes the original URL instead which we'll check
+	// against the SAML response when we get it .
 	relayState, err := m.RequestTracker.TrackRequest(w, r, authReq.ID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -173,19 +192,8 @@ func (m *Middleware) HandleStartAuthFlow(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	if binding == saml.HTTPPostBinding {
-		w.Header().Add("Content-Security-Policy", ""+
-			"default-src; "+
-			"script-src 'sha256-AjPdJSbZmeWHnEc5ykvJFay8FTWeTeRbs9dutfZ0HqE='; "+
-			"reflected-xss block; referrer no-referrer;")
-		w.Header().Add("Content-type", "text/html")
-		var buf bytes.Buffer
-		buf.WriteString(`<!DOCTYPE html><html><body>`)
-		buf.Write(authReq.Post(relayState))
-		buf.WriteString(`</body></html>`)
-		if _, err := w.Write(buf.Bytes()); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
+		m.postHeader(w)
+		m.postBody(w, authReq.Post(relayState))
 		return
 	}
 	panic("not reached")
@@ -196,7 +204,7 @@ func (m *Middleware) CreateSessionFromAssertion(w http.ResponseWriter, r *http.R
 	if trackedRequestIndex := r.Form.Get("RelayState"); trackedRequestIndex != "" {
 		trackedRequest, err := m.RequestTracker.GetTrackedRequest(r, trackedRequestIndex)
 		if err != nil {
-			if err == http.ErrNoCookie && m.ServiceProvider.AllowIDPInitiated {
+			if errors.Is(err, http.ErrNoCookie) && m.ServiceProvider.AllowIDPInitiated {
 				if uri := r.Form.Get("RelayState"); uri != "" {
 					redirectURI = uri
 				}
@@ -225,7 +233,7 @@ func (m *Middleware) CreateSessionFromAssertion(w http.ResponseWriter, r *http.R
 // RequireAttribute returns a middleware function that requires that the
 // SAML attribute `name` be set to `value`. This can be used to require
 // that a remote user be a member of a group. It relies on the Claims assigned
-// to to the context in RequireAccount.
+// to the context in RequireAccount.
 //
 // For example:
 //

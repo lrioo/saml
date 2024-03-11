@@ -2,7 +2,6 @@ package saml
 
 import (
 	"bytes"
-	"compress/flate"
 	"context"
 	"crypto/rsa"
 	"crypto/tls"
@@ -11,7 +10,6 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
-	"html/template"
 	"io"
 	"net/http"
 	"net/url"
@@ -44,6 +42,31 @@ const (
 	EmailAddressNameIDFormat NameIDFormat = "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress"
 	PersistentNameIDFormat   NameIDFormat = "urn:oasis:names:tc:SAML:2.0:nameid-format:persistent"
 )
+
+// DefaultValidDuration is how long we assert that the SP metadata is valid.
+const DefaultValidDuration = time.Hour * 24 * 2
+
+// DefaultCacheDuration is how long we ask the IDP to cache the SP metadata.
+const DefaultCacheDuration = time.Hour * 24 * 1
+
+type signatureRequirement int
+
+const (
+	signatureRequired signatureRequirement = iota
+	signatureNotRequired
+)
+
+var errSignatureElementNotPresent = errors.New("signature element not present")
+
+// MaxIssueDelay is the longest allowed time between when a SAML assertion is
+// issued by the IDP and the time it is received by ParseResponse. This is used
+// to prevent old responses from being replayed (while allowing for some clock
+// drift between the SP and IDP).
+var MaxIssueDelay = time.Second * 90
+
+// MaxClockSkew allows for leeway for clock skew between the IDP and SP when
+// validating assertions. It defaults to 180 seconds (matches shibboleth).
+var MaxClockSkew = time.Second * 180
 
 // SignatureVerifier verifies a signature
 //
@@ -100,7 +123,7 @@ type ServiceProvider struct {
 	MetadataValidDuration time.Duration
 
 	// ForceAuthn allows you to force re-authentication of users even if the user
-	// has a SSO session at the IdP.
+	// has SSO session at the IdP.
 	ForceAuthn *bool
 
 	// RequestedAuthnContext allow you to specify the requested authentication
@@ -125,21 +148,64 @@ type ServiceProvider struct {
 	LogoutBindings []string
 }
 
-// MaxIssueDelay is the longest allowed time between when a SAML assertion is
-// issued by the IDP and the time it is received by ParseResponse. This is used
-// to prevent old responses from being replayed (while allowing for some clock
-// drift between the SP and IDP).
-var MaxIssueDelay = time.Second * 90
+func (sp *ServiceProvider) nameIDFormat() string {
+	var nameIDFormat string
+	switch sp.AuthnNameIDFormat {
+	case "":
+		// To maintain library back-compat, use "transient" if unset.
+		nameIDFormat = string(TransientNameIDFormat)
+	case UnspecifiedNameIDFormat:
+		// Spec defines an empty value as "unspecified" so don't set one.
+	default:
+		nameIDFormat = string(sp.AuthnNameIDFormat)
+	}
+	return nameIDFormat
+}
 
-// MaxClockSkew allows for leeway for clock skew between the IDP and SP when
-// validating assertions. It defaults to 180 seconds (matches shibboleth).
-var MaxClockSkew = time.Second * 180
+// getIDPSigningCerts returns the certificates which we can use to verify things
+// signed by the IDP in PEM format, or nil if no such certificate is found.
+func (sp *ServiceProvider) getIDPSigningCerts() ([]*x509.Certificate, error) {
+	var certStrings []string
 
-// DefaultValidDuration is how long we assert that the SP metadata is valid.
-const DefaultValidDuration = time.Hour * 24 * 2
+	// We need to include non-empty certs where the "use" attribute is
+	// either set to "signing" or is missing
+	for _, idpSSODescriptor := range sp.IDPMetadata.IDPSSODescriptors {
+		for _, keyDescriptor := range idpSSODescriptor.KeyDescriptors {
+			if len(keyDescriptor.KeyInfo.X509Data.X509Certificates) != 0 {
+				switch keyDescriptor.Use {
+				case "", "signing":
+					for _, certificate := range keyDescriptor.KeyInfo.X509Data.X509Certificates {
+						certStrings = append(certStrings, certificate.Data)
+					}
+				}
+			}
+		}
+	}
 
-// DefaultCacheDuration is how long we ask the IDP to cache the SP metadata.
-const DefaultCacheDuration = time.Hour * 24 * 1
+	if len(certStrings) == 0 {
+		return nil, errors.New("cannot find any signing certificate in the IDP SSO descriptor")
+	}
+
+	certs := make([]*x509.Certificate, len(certStrings))
+
+	// cleanup whitespace
+	regex := regexp.MustCompile(`\s+`)
+	for i, certStr := range certStrings {
+		certStr = regex.ReplaceAllString(certStr, "")
+		certBytes, err := base64.StdEncoding.DecodeString(certStr)
+		if err != nil {
+			return nil, fmt.Errorf("cannot parse certificate: %s", err)
+		}
+
+		parsedCert, err := x509.ParseCertificate(certBytes)
+		if err != nil {
+			return nil, err
+		}
+		certs[i] = parsedCert
+	}
+
+	return certs, nil
+}
 
 // Metadata returns the service provider metadata
 func (sp *ServiceProvider) Metadata() *EntityDescriptor {
@@ -234,67 +300,7 @@ func (sp *ServiceProvider) Metadata() *EntityDescriptor {
 	}
 }
 
-// MakeRedirectAuthenticationRequest creates a SAML authentication request using
-// the HTTP-Redirect binding. It returns a URL that we will redirect the user to
-// in order to start the auth process.
-func (sp *ServiceProvider) MakeRedirectAuthenticationRequest(relayState string) (*url.URL, error) {
-	req, err := sp.MakeAuthenticationRequest(sp.GetSSOBindingLocation(HTTPRedirectBinding), HTTPRedirectBinding, HTTPPostBinding)
-	if err != nil {
-		return nil, err
-	}
-	return req.Redirect(relayState, sp)
-}
-
-// Redirect returns a URL suitable for using the redirect binding with the request
-func (r *AuthnRequest) Redirect(relayState string, sp *ServiceProvider) (*url.URL, error) {
-	w := &bytes.Buffer{}
-	w1 := base64.NewEncoder(base64.StdEncoding, w)
-	w2, _ := flate.NewWriter(w1, 9)
-	doc := etree.NewDocument()
-	doc.SetRoot(r.Element())
-	if _, err := doc.WriteTo(w2); err != nil {
-		panic(err)
-	}
-	if err := w2.Close(); err != nil {
-		panic(err)
-	}
-	if err := w1.Close(); err != nil {
-		panic(err)
-	}
-
-	rv, _ := url.Parse(r.Destination)
-	// We can't depend on Query().set() as order matters for signing
-	query := rv.RawQuery
-	if len(query) > 0 {
-		query += "&SAMLRequest=" + url.QueryEscape(w.String())
-	} else {
-		query += "SAMLRequest=" + url.QueryEscape(w.String())
-	}
-
-	if relayState != "" {
-		query += "&RelayState=" + relayState
-	}
-	if len(sp.SignatureMethod) > 0 {
-		query += "&SigAlg=" + url.QueryEscape(sp.SignatureMethod)
-		signingContext, err := GetSigningContext(sp)
-
-		if err != nil {
-			return nil, err
-		}
-
-		sig, err := signingContext.SignString(query)
-		if err != nil {
-			return nil, err
-		}
-		query += "&Signature=" + url.QueryEscape(base64.StdEncoding.EncodeToString(sig))
-	}
-
-	rv.RawQuery = query
-
-	return rv, nil
-}
-
-// GetSSOBindingLocation returns URL for the IDP's Single Sign On Service binding
+// GetSSOBindingLocation returns URL for the IDP Single Sign On Service binding
 // of the specified type (HTTPRedirectBinding or HTTPPostBinding)
 func (sp *ServiceProvider) GetSSOBindingLocation(binding string) string {
 	for _, idpSSODescriptor := range sp.IDPMetadata.IDPSSODescriptors {
@@ -307,7 +313,7 @@ func (sp *ServiceProvider) GetSSOBindingLocation(binding string) string {
 	return ""
 }
 
-// GetArtifactBindingLocation returns URL for the IDP's Artifact binding of the
+// GetArtifactBindingLocation returns URL for the IDP Artifact binding of the
 // specified type
 func (sp *ServiceProvider) GetArtifactBindingLocation(binding string) string {
 	for _, idpSSODescriptor := range sp.IDPMetadata.IDPSSODescriptors {
@@ -320,7 +326,7 @@ func (sp *ServiceProvider) GetArtifactBindingLocation(binding string) string {
 	return ""
 }
 
-// GetSLOBindingLocation returns URL for the IDP's Single Log Out Service binding
+// GetSLOBindingLocation returns URL for the IDP Single Log Out Service binding
 // of the specified type (HTTPRedirectBinding or HTTPPostBinding)
 func (sp *ServiceProvider) GetSLOBindingLocation(binding string) string {
 	for _, idpSSODescriptor := range sp.IDPMetadata.IDPSSODescriptors {
@@ -333,71 +339,26 @@ func (sp *ServiceProvider) GetSLOBindingLocation(binding string) string {
 	return ""
 }
 
-// getIDPSigningCerts returns the certificates which we can use to verify things
-// signed by the IDP in PEM format, or nil if no such certificate is found.
-func (sp *ServiceProvider) getIDPSigningCerts() ([]*x509.Certificate, error) {
-	var certStrs []string
-
-	// We need to include non-empty certs where the "use" attribute is
-	// either set to "signing" or is missing
-	for _, idpSSODescriptor := range sp.IDPMetadata.IDPSSODescriptors {
-		for _, keyDescriptor := range idpSSODescriptor.KeyDescriptors {
-			if len(keyDescriptor.KeyInfo.X509Data.X509Certificates) != 0 {
-				switch keyDescriptor.Use {
-				case "", "signing":
-					for _, certificate := range keyDescriptor.KeyInfo.X509Data.X509Certificates {
-						certStrs = append(certStrs, certificate.Data)
-					}
-				}
-			}
-		}
+// MakeRedirectAuthenticationRequest creates a SAML authentication request using
+// the HTTP-Redirect binding. It returns a URL that we will redirect the user to
+// in order to start the auth process.
+func (sp *ServiceProvider) MakeRedirectAuthenticationRequest(relayState string) (*url.URL, error) {
+	req, err := sp.MakeAuthenticationRequest(sp.GetSSOBindingLocation(HTTPRedirectBinding), HTTPRedirectBinding, HTTPPostBinding)
+	if err != nil {
+		return nil, err
 	}
-
-	if len(certStrs) == 0 {
-		return nil, errors.New("cannot find any signing certificate in the IDP SSO descriptor")
-	}
-
-	certs := make([]*x509.Certificate, len(certStrs))
-
-	// cleanup whitespace
-	regex := regexp.MustCompile(`\s+`)
-	for i, certStr := range certStrs {
-		certStr = regex.ReplaceAllString(certStr, "")
-		certBytes, err := base64.StdEncoding.DecodeString(certStr)
-		if err != nil {
-			return nil, fmt.Errorf("cannot parse certificate: %s", err)
-		}
-
-		parsedCert, err := x509.ParseCertificate(certBytes)
-		if err != nil {
-			return nil, err
-		}
-		certs[i] = parsedCert
-	}
-
-	return certs, nil
+	return req.Redirect(relayState, sp)
 }
 
-// MakeArtifactResolveRequest produces a new ArtifactResolve object to send to the idp's Artifact resolver
-func (sp *ServiceProvider) MakeArtifactResolveRequest(artifactID string) (*ArtifactResolve, error) {
-	req := ArtifactResolve{
-		ID:           fmt.Sprintf("id-%x", randomBytes(20)),
-		IssueInstant: TimeNow(),
-		Version:      "2.0",
-		Issuer: &Issuer{
-			Format: "urn:oasis:names:tc:SAML:2.0:nameid-format:entity",
-			Value:  firstSet(sp.EntityID, sp.MetadataURL.String()),
-		},
-		Artifact: artifactID,
+// MakePostAuthenticationRequest creates a SAML authentication request using
+// the HTTP-POST binding. It returns HTML text representing an HTML form that
+// can be sent presented to a browser to initiate the login process.
+func (sp *ServiceProvider) MakePostAuthenticationRequest(relayState string) ([]byte, error) {
+	req, err := sp.MakeAuthenticationRequest(sp.GetSSOBindingLocation(HTTPPostBinding), HTTPPostBinding, HTTPPostBinding)
+	if err != nil {
+		return nil, err
 	}
-
-	if len(sp.SignatureMethod) > 0 {
-		if err := sp.SignArtifactResolve(&req); err != nil {
-			return nil, err
-		}
-	}
-
-	return &req, nil
+	return req.Post(relayState), nil
 }
 
 // MakeAuthenticationRequest produces a new AuthnRequest object to send to the idpURL
@@ -436,62 +397,14 @@ func (sp *ServiceProvider) MakeAuthenticationRequest(idpURL string, binding stri
 	return &req, nil
 }
 
-// GetSigningContext returns a dsig.SigningContext initialized based on the Service Provider's configuration
-func GetSigningContext(sp *ServiceProvider) (*dsig.SigningContext, error) {
-	keyPair := tls.Certificate{
-		Certificate: [][]byte{sp.Certificate.Raw},
-		PrivateKey:  sp.Key,
-		Leaf:        sp.Certificate,
-	}
-	// TODO: add intermediates for SP
-	// for _, cert := range sp.Intermediates {
-	// 	keyPair.Certificate = append(keyPair.Certificate, cert.Raw)
-	// }
-	keyStore := dsig.TLSCertKeyStore(keyPair)
-
-	if sp.SignatureMethod != dsig.RSASHA1SignatureMethod &&
-		sp.SignatureMethod != dsig.RSASHA256SignatureMethod &&
-		sp.SignatureMethod != dsig.RSASHA512SignatureMethod {
-		return nil, fmt.Errorf("invalid signing method %s", sp.SignatureMethod)
-	}
-	signatureMethod := sp.SignatureMethod
-	signingContext := dsig.NewDefaultSigningContext(keyStore)
-	signingContext.Canonicalizer = dsig.MakeC14N10ExclusiveCanonicalizerWithPrefixList(canonicalizerPrefixList)
-	if err := signingContext.SetSignatureMethod(signatureMethod); err != nil {
-		return nil, err
-	}
-
-	return signingContext, nil
-}
-
-// SignArtifactResolve adds the `Signature` element to the `ArtifactResolve`.
-func (sp *ServiceProvider) SignArtifactResolve(req *ArtifactResolve) error {
-	signingContext, err := GetSigningContext(sp)
-	if err != nil {
-		return err
-	}
-	assertionEl := req.Element()
-
-	signedRequestEl, err := signingContext.SignEnveloped(assertionEl)
-	if err != nil {
-		return err
-	}
-
-	sigEl := signedRequestEl.Child[len(signedRequestEl.Child)-1]
-	req.Signature = sigEl.(*etree.Element)
-	return nil
-}
-
 // SignAuthnRequest adds the `Signature` element to the `AuthnRequest`.
 func (sp *ServiceProvider) SignAuthnRequest(req *AuthnRequest) error {
-
 	signingContext, err := GetSigningContext(sp)
 	if err != nil {
 		return err
 	}
-	assertionEl := req.Element()
 
-	signedRequestEl, err := signingContext.SignEnveloped(assertionEl)
+	signedRequestEl, err := signingContext.SignEnveloped(req.Element())
 	if err != nil {
 		return err
 	}
@@ -501,100 +414,252 @@ func (sp *ServiceProvider) SignAuthnRequest(req *AuthnRequest) error {
 	return nil
 }
 
-// MakePostAuthenticationRequest creates a SAML authentication request using
+// MakeRedirectLogoutRequest creates a SAML authentication request using
+// the HTTP-Redirect binding. It returns a URL that we will redirect the user to
+// in order to start the auth process.
+func (sp *ServiceProvider) MakeRedirectLogoutRequest(nameID, relayState string) (*url.URL, error) {
+	req, err := sp.MakeLogoutRequest(sp.GetSLOBindingLocation(HTTPRedirectBinding), nameID)
+	if err != nil {
+		return nil, err
+	}
+	return req.Redirect(relayState, sp), nil
+}
+
+// MakePostLogoutRequest creates a SAML authentication request using
 // the HTTP-POST binding. It returns HTML text representing an HTML form that
-// can be sent presented to a browser to initiate the login process.
-func (sp *ServiceProvider) MakePostAuthenticationRequest(relayState string) ([]byte, error) {
-	req, err := sp.MakeAuthenticationRequest(sp.GetSSOBindingLocation(HTTPPostBinding), HTTPPostBinding, HTTPPostBinding)
+// can be sent presented to a browser to initiate the logout process.
+func (sp *ServiceProvider) MakePostLogoutRequest(nameID, relayState string) ([]byte, error) {
+	req, err := sp.MakeLogoutRequest(sp.GetSLOBindingLocation(HTTPPostBinding), nameID)
 	if err != nil {
 		return nil, err
 	}
 	return req.Post(relayState), nil
 }
 
-// Post returns an HTML form suitable for using the HTTP-POST binding with the request
-func (r *AuthnRequest) Post(relayState string) []byte {
-	doc := etree.NewDocument()
-	doc.SetRoot(r.Element())
-	reqBuf, err := doc.WriteToBytes()
-	if err != nil {
-		panic(err)
-	}
-	encodedReqBuf := base64.StdEncoding.EncodeToString(reqBuf)
+// MakeLogoutRequest produces a new LogoutRequest object for idpURL.
+func (sp *ServiceProvider) MakeLogoutRequest(idpURL, nameID string) (*LogoutRequest, error) {
 
-	tmpl := template.Must(template.New("saml-post-form").Parse(`` +
-		`<form method="post" action="{{.URL}}" id="SAMLRequestForm">` +
-		`<input type="hidden" name="SAMLRequest" value="{{.SAMLRequest}}" />` +
-		`<input type="hidden" name="RelayState" value="{{.RelayState}}" />` +
-		`<input id="SAMLSubmitButton" type="submit" value="Submit" />` +
-		`</form>` +
-		`<script>document.getElementById('SAMLSubmitButton').style.visibility="hidden";` +
-		`document.getElementById('SAMLRequestForm').submit();</script>`))
-	data := struct {
-		URL         string
-		SAMLRequest string
-		RelayState  string
-	}{
-		URL:         r.Destination,
-		SAMLRequest: encodedReqBuf,
-		RelayState:  relayState,
+	req := LogoutRequest{
+		ID:           fmt.Sprintf("id-%x", randomBytes(20)),
+		IssueInstant: TimeNow(),
+		Version:      "2.0",
+		Destination:  idpURL,
+		Issuer: &Issuer{
+			Format: "urn:oasis:names:tc:SAML:2.0:nameid-format:entity",
+			Value:  firstSet(sp.EntityID, sp.MetadataURL.String()),
+		},
+		NameID: &NameID{
+			Format:          sp.nameIDFormat(),
+			Value:           nameID,
+			NameQualifier:   sp.IDPMetadata.EntityID,
+			SPNameQualifier: sp.Metadata().EntityID,
+		},
 	}
-
-	rv := bytes.Buffer{}
-	if err := tmpl.Execute(&rv, data); err != nil {
-		panic(err)
+	if len(sp.SignatureMethod) > 0 {
+		if err := sp.SignLogoutRequest(&req); err != nil {
+			return nil, err
+		}
 	}
-
-	return rv.Bytes()
+	return &req, nil
 }
 
-// AssertionAttributes is a list of AssertionAttribute
-type AssertionAttributes []AssertionAttribute
-
-// Get returns the assertion attribute whose Name or FriendlyName
-// matches name, or nil if no matching attribute is found.
-func (aa AssertionAttributes) Get(name string) *AssertionAttribute {
-	for _, attr := range aa {
-		if attr.Name == name {
-			return &attr
-		}
-		if attr.FriendlyName == name {
-			return &attr
-		}
+// SignLogoutRequest adds the `Signature` element to the `LogoutRequest`.
+func (sp *ServiceProvider) SignLogoutRequest(req *LogoutRequest) error {
+	signingContext, err := GetSigningContext(sp)
+	if err != nil {
+		return err
 	}
+
+	signedRequestEl, err := signingContext.SignEnveloped(req.Element())
+	if err != nil {
+		return err
+	}
+
+	sigEl := signedRequestEl.Child[len(signedRequestEl.Child)-1]
+	req.Signature = sigEl.(*etree.Element)
 	return nil
 }
 
-// AssertionAttribute represents an attribute of the user extracted from
-// a SAML Assertion.
-type AssertionAttribute struct {
-	FriendlyName string
-	Name         string
-	Value        string
+// MakeRedirectLogoutResponse creates a SAML LogoutResponse using
+// the HTTP-Redirect binding. It returns a URL that we will redirect the user to
+// for LogoutResponse.
+func (sp *ServiceProvider) MakeRedirectLogoutResponse(logoutRequestID, relayState string) (*url.URL, error) {
+	resp, err := sp.MakeLogoutResponse(sp.GetSLOBindingLocation(HTTPRedirectBinding), logoutRequestID)
+	if err != nil {
+		return nil, err
+	}
+	return resp.Redirect(relayState, sp), nil
 }
 
-// InvalidResponseError is the error produced by ParseResponse when it fails.
-// The underlying error is in PrivateErr. Response is the response as it was
-// known at the time validation failed. Now is the time that was used to validate
-// time-dependent parts of the assertion.
-type InvalidResponseError struct {
-	PrivateErr error
-	Response   string
-	Now        time.Time
+// MakePostLogoutResponse creates a SAML LogoutResponse using
+// the HTTP-POST binding. It returns HTML text representing an HTML form that
+// can be sent presented to a browser for LogoutResponse.
+func (sp *ServiceProvider) MakePostLogoutResponse(logoutRequestID, relayState string) ([]byte, error) {
+	resp, err := sp.MakeLogoutResponse(sp.GetSLOBindingLocation(HTTPPostBinding), logoutRequestID)
+	if err != nil {
+		return nil, err
+	}
+	return resp.Post(relayState), nil
 }
 
-func (ivr *InvalidResponseError) Error() string {
-	return "Authentication failed"
+// MakeLogoutResponse produces a new LogoutResponse object for idpURL and logoutRequestID.
+func (sp *ServiceProvider) MakeLogoutResponse(idpURL, logoutRequestID string) (*LogoutResponse, error) {
+	response := LogoutResponse{
+		ID:           fmt.Sprintf("id-%x", randomBytes(20)),
+		InResponseTo: logoutRequestID,
+		Version:      "2.0",
+		IssueInstant: TimeNow(),
+		Destination:  idpURL,
+		Issuer: &Issuer{
+			Format: "urn:oasis:names:tc:SAML:2.0:nameid-format:entity",
+			Value:  firstSet(sp.EntityID, sp.MetadataURL.String()),
+		},
+		Status: Status{
+			StatusCode: StatusCode{
+				Value: StatusSuccess,
+			},
+		},
+	}
+
+	if len(sp.SignatureMethod) > 0 {
+		if err := sp.SignLogoutResponse(&response); err != nil {
+			return nil, err
+		}
+	}
+	return &response, nil
 }
 
-// ErrBadStatus is returned when the assertion provided is valid but the
-// status code is not "urn:oasis:names:tc:SAML:2.0:status:Success".
-type ErrBadStatus struct {
-	Status string
+// SignLogoutResponse adds the `Signature` element to the `LogoutResponse`.
+func (sp *ServiceProvider) SignLogoutResponse(resp *LogoutResponse) error {
+	signingContext, err := GetSigningContext(sp)
+	if err != nil {
+		return err
+	}
+
+	signedRequestEl, err := signingContext.SignEnveloped(resp.Element())
+	if err != nil {
+		return err
+	}
+
+	sigEl := signedRequestEl.Child[len(signedRequestEl.Child)-1]
+	resp.Signature = sigEl.(*etree.Element)
+	return nil
 }
 
-func (e ErrBadStatus) Error() string {
-	return e.Status
+// ValidateLogoutResponseRequest validates the LogoutResponse content from the request
+func (sp *ServiceProvider) ValidateLogoutResponseRequest(req *http.Request) error {
+	if data := req.URL.Query().Get("SAMLResponse"); data != "" {
+		return sp.ValidateLogoutResponseRedirect(data)
+	}
+
+	err := req.ParseForm()
+	if err != nil {
+		return fmt.Errorf("unable to parse form: %v", err)
+	}
+
+	return sp.ValidateLogoutResponseForm(req.PostForm.Get("SAMLResponse"))
+}
+
+// ValidateLogoutResponseForm returns a nil error if the logout response is valid.
+func (sp *ServiceProvider) ValidateLogoutResponseForm(postFormData string) error {
+	retErr := &InvalidResponseError{
+		Now: TimeNow(),
+	}
+
+	rawResponseBuf, err := base64.StdEncoding.DecodeString(postFormData)
+	if err != nil {
+		retErr.PrivateErr = fmt.Errorf("unable to parse base64: %s", err)
+		return retErr
+	}
+	retErr.Response = string(rawResponseBuf)
+
+	// TODO(ross): add test case for this (SLO does not have tests right now)
+	if err := xrv.Validate(bytes.NewReader(rawResponseBuf)); err != nil {
+		return fmt.Errorf("response contains invalid XML: %s", err)
+	}
+
+	doc := etree.NewDocument()
+	if err := doc.ReadFromBytes(rawResponseBuf); err != nil {
+		retErr.PrivateErr = err
+		return retErr
+	}
+
+	if err := sp.validateSignature(doc.Root()); err != nil {
+		retErr.PrivateErr = err
+		return retErr
+	}
+
+	var resp LogoutResponse
+	if err := unmarshalElement(doc.Root(), &resp); err != nil {
+		retErr.PrivateErr = err
+		return retErr
+	}
+	return sp.validateLogoutResponse(&resp)
+}
+
+// ValidateLogoutResponseRedirect returns a nil error if the logout response is valid.
+//
+// URL Binding appears to be gzip / flate encoded
+// See https://www.oasis-open.org/committees/download.php/20645/sstc-saml-tech-overview-2%200-draft-10.pdf  6.6
+func (sp *ServiceProvider) ValidateLogoutResponseRedirect(queryParameterData string) error {
+	retErr := &InvalidResponseError{
+		Now: TimeNow(),
+	}
+
+	rawResponseBuf, err := base64.StdEncoding.DecodeString(queryParameterData)
+	if err != nil {
+		retErr.PrivateErr = fmt.Errorf("unable to parse base64: %s", err)
+		return retErr
+	}
+	retErr.Response = string(rawResponseBuf)
+
+	gr, err := io.ReadAll(newSaferFlateReader(bytes.NewBuffer(rawResponseBuf)))
+	if err != nil {
+		retErr.PrivateErr = err
+		return retErr
+	}
+
+	if err := xrv.Validate(bytes.NewReader(gr)); err != nil {
+		return err
+	}
+
+	doc := etree.NewDocument()
+	if err := doc.ReadFromBytes(rawResponseBuf); err != nil {
+		retErr.PrivateErr = err
+		return retErr
+	}
+
+	if err := sp.validateSignature(doc.Root()); err != nil {
+		retErr.PrivateErr = err
+		return retErr
+	}
+
+	var resp LogoutResponse
+	if err := unmarshalElement(doc.Root(), &resp); err != nil {
+		retErr.PrivateErr = err
+		return retErr
+	}
+	return sp.validateLogoutResponse(&resp)
+}
+
+// validateLogoutResponse validates the LogoutResponse fields. Returns a nil error if the LogoutResponse is valid.
+func (sp *ServiceProvider) validateLogoutResponse(resp *LogoutResponse) error {
+	if resp.Destination != sp.SloURL.String() {
+		return fmt.Errorf("`Destination` does not match SloURL (expected %q)", sp.SloURL.String())
+	}
+
+	now := time.Now()
+	if resp.IssueInstant.Add(MaxIssueDelay).Before(now) {
+		return fmt.Errorf("issueInstant expired at %s", resp.IssueInstant.Add(MaxIssueDelay))
+	}
+	if resp.Issuer.Value != sp.IDPMetadata.EntityID {
+		return fmt.Errorf("issuer does not match the IDP metadata (expected %q)", sp.IDPMetadata.EntityID)
+	}
+	if resp.Status.StatusCode.Value != StatusSuccess {
+		return fmt.Errorf("status code was not %s", StatusSuccess)
+	}
+
+	return nil
 }
 
 // ParseResponse extracts the SAML IDP response received in req, resolves
@@ -644,12 +709,12 @@ func (sp *ServiceProvider) handleArtifactRequest(ctx context.Context, artifactID
 		}
 	}()
 	if response.StatusCode != 200 {
-		retErr.PrivateErr = fmt.Errorf("Error during artifact resolution: HTTP status %d (%s)", response.StatusCode, response.Status)
+		retErr.PrivateErr = fmt.Errorf("error during artifact resolution: HTTP status %d (%s)", response.StatusCode, response.Status)
 		return nil, retErr
 	}
 	responseBody, err := io.ReadAll(response.Body)
 	if err != nil {
-		retErr.PrivateErr = fmt.Errorf("Error during artifact resolution: %s", err)
+		retErr.PrivateErr = fmt.Errorf("error during artifact resolution: %s", err)
 		return nil, retErr
 	}
 	assertion, err := sp.ParseXMLArtifactResponse(responseBody, possibleRequestIDs, artifactResolveRequest.ID)
@@ -659,22 +724,43 @@ func (sp *ServiceProvider) handleArtifactRequest(ctx context.Context, artifactID
 	return assertion, nil
 }
 
-func (sp *ServiceProvider) parseResponseHTTP(req *http.Request, possibleRequestIDs []string) (*Assertion, error) {
-	retErr := &InvalidResponseError{
-		Now: TimeNow(),
+// MakeArtifactResolveRequest produces a new ArtifactResolve object to send to the idp Artifact resolver
+func (sp *ServiceProvider) MakeArtifactResolveRequest(artifactID string) (*ArtifactResolve, error) {
+	req := ArtifactResolve{
+		ID:           fmt.Sprintf("id-%x", randomBytes(20)),
+		IssueInstant: TimeNow(),
+		Version:      "2.0",
+		Issuer: &Issuer{
+			Format: "urn:oasis:names:tc:SAML:2.0:nameid-format:entity",
+			Value:  firstSet(sp.EntityID, sp.MetadataURL.String()),
+		},
+		Artifact: artifactID,
 	}
 
-	rawResponseBuf, err := base64.StdEncoding.DecodeString(req.PostForm.Get("SAMLResponse"))
-	if err != nil {
-		retErr.PrivateErr = fmt.Errorf("cannot parse base64: %s", err)
-		return nil, retErr
+	if len(sp.SignatureMethod) > 0 {
+		if err := sp.SignArtifactResolve(&req); err != nil {
+			return nil, err
+		}
 	}
 
-	assertion, err := sp.ParseXMLResponse(rawResponseBuf, possibleRequestIDs)
+	return &req, nil
+}
+
+// SignArtifactResolve adds the `Signature` element to the `ArtifactResolve`.
+func (sp *ServiceProvider) SignArtifactResolve(req *ArtifactResolve) error {
+	signingContext, err := GetSigningContext(sp)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	return assertion, nil
+
+	signedRequestEl, err := signingContext.SignEnveloped(req.Element())
+	if err != nil {
+		return err
+	}
+
+	sigEl := signedRequestEl.Child[len(signedRequestEl.Child)-1]
+	req.Signature = sigEl.(*etree.Element)
+	return nil
 }
 
 // ParseXMLArtifactResponse validates the SAML Artifact resolver response
@@ -760,13 +846,13 @@ func (sp *ServiceProvider) parseArtifactResponse(artifactResponseEl *etree.Eleme
 		}
 	}
 
-	var signatureRequirement signatureRequirement
+	var signRequirement signatureRequirement
 	sigErr := sp.validateSignature(artifactResponseEl)
-	switch sigErr {
-	case nil:
-		signatureRequirement = signatureNotRequired
-	case errSignatureElementNotPresent:
-		signatureRequirement = signatureRequired
+	switch {
+	case sigErr == nil:
+		signRequirement = signatureNotRequired
+	case errors.Is(sigErr, errSignatureElementNotPresent):
+		signRequirement = signatureRequired
 	default:
 		retErr.PrivateErr = sigErr
 		return nil, retErr
@@ -778,12 +864,30 @@ func (sp *ServiceProvider) parseArtifactResponse(artifactResponseEl *etree.Eleme
 		return nil, retErr
 	}
 
-	assertion, err := sp.parseResponse(responseEl, possibleRequestIDs, now, signatureRequirement)
+	assertion, err := sp.parseResponse(responseEl, possibleRequestIDs, now, signRequirement)
 	if err != nil {
 		retErr.PrivateErr = err
 		return nil, retErr
 	}
 
+	return assertion, nil
+}
+
+func (sp *ServiceProvider) parseResponseHTTP(req *http.Request, possibleRequestIDs []string) (*Assertion, error) {
+	retErr := &InvalidResponseError{
+		Now: TimeNow(),
+	}
+
+	rawResponseBuf, err := base64.StdEncoding.DecodeString(req.PostForm.Get("SAMLResponse"))
+	if err != nil {
+		retErr.PrivateErr = fmt.Errorf("cannot parse base64: %s", err)
+		return nil, retErr
+	}
+
+	assertion, err := sp.ParseXMLResponse(rawResponseBuf, possibleRequestIDs)
+	if err != nil {
+		return nil, err
+	}
 	return assertion, nil
 }
 
@@ -831,13 +935,6 @@ func (sp *ServiceProvider) ParseXMLResponse(decodedResponseXML []byte, possibleR
 	return assertion, nil
 }
 
-type signatureRequirement int
-
-const (
-	signatureRequired signatureRequirement = iota
-	signatureNotRequired
-)
-
 // validateXMLResponse validates the SAML IDP response and returns
 // the verified assertion.
 //
@@ -849,7 +946,7 @@ func (sp *ServiceProvider) parseResponse(responseEl *etree.Element, possibleRequ
 	var responseHasSignature bool
 	if signatureRequirement == signatureRequired {
 		responseSignatureErr = sp.validateSignature(responseEl)
-		if responseSignatureErr != errSignatureElementNotPresent {
+		if !errors.Is(responseSignatureErr, errSignatureElementNotPresent) {
 			responseHasSignature = true
 		}
 
@@ -872,17 +969,17 @@ func (sp *ServiceProvider) parseResponse(responseEl *etree.Element, possibleRequ
 			}
 		}
 
-		requestIDvalid := false
+		requestIDValid := false
 		if sp.AllowIDPInitiated {
-			requestIDvalid = true
+			requestIDValid = true
 		} else {
 			for _, possibleRequestID := range possibleRequestIDs {
 				if response.InResponseTo == possibleRequestID {
-					requestIDvalid = true
+					requestIDValid = true
 				}
 			}
 		}
-		if !requestIDvalid {
+		if !requestIDValid {
 			return nil, fmt.Errorf("`InResponseTo` does not match any of the possible request IDs (expected %v)", possibleRequestIDs)
 		}
 
@@ -898,11 +995,11 @@ func (sp *ServiceProvider) parseResponse(responseEl *etree.Element, possibleRequ
 	}
 
 	if signatureRequirement == signatureRequired {
-		switch responseSignatureErr {
-		case nil:
+		switch {
+		case responseSignatureErr == nil:
 			// since the request has a signature, none of the Assertions need one
 			signatureRequirement = signatureNotRequired
-		case errSignatureElementNotPresent:
+		case errors.Is(responseSignatureErr, errSignatureElementNotPresent):
 			// the request has no signature, so assertions must be signed
 			signatureRequirement = signatureRequired // nop
 		default:
@@ -1032,7 +1129,7 @@ func (sp *ServiceProvider) validateAssertion(assertion *Assertion, possibleReque
 		return fmt.Errorf("issuer is not %q", sp.IDPMetadata.EntityID)
 	}
 	for _, subjectConfirmation := range assertion.Subject.SubjectConfirmations {
-		requestIDvalid := false
+		requestIDValid := false
 
 		// We *DO NOT* validate InResponseTo when AllowIDPInitiated is set. Here's why:
 		//
@@ -1054,11 +1151,11 @@ func (sp *ServiceProvider) validateAssertion(assertion *Assertion, possibleReque
 		if !sp.AllowIDPInitiated {
 			for _, possibleRequestID := range possibleRequestIDs {
 				if subjectConfirmation.SubjectConfirmationData.InResponseTo == possibleRequestID {
-					requestIDvalid = true
+					requestIDValid = true
 					break
 				}
 			}
-			if !requestIDvalid {
+			if !requestIDValid {
 				return fmt.Errorf("assertion SubjectConfirmation one of the possible request IDs (%v)", possibleRequestIDs)
 			}
 		}
@@ -1089,8 +1186,6 @@ func (sp *ServiceProvider) validateAssertion(assertion *Assertion, possibleReque
 	return nil
 }
 
-var errSignatureElementNotPresent = errors.New("signature element not present")
-
 // validateSignature returns nil iff the Signature embedded in the element is valid
 func (sp *ServiceProvider) validateSignature(el *etree.Element) error {
 	sigEl, err := findChild(el, "http://www.w3.org/2000/09/xmldsig#", "Signature")
@@ -1111,7 +1206,6 @@ func (sp *ServiceProvider) validateSignature(el *etree.Element) error {
 	}
 
 	validationContext := dsig.NewDefaultValidationContext(&certificateStore)
-	validationContext.IdAttribute = "ID"
 	if Clock != nil {
 		validationContext.Clock = Clock
 	}
@@ -1157,8 +1251,8 @@ func (sp *ServiceProvider) validateSignature(el *etree.Element) error {
 	return nil
 }
 
-// SignLogoutRequest adds the `Signature` element to the `LogoutRequest`.
-func (sp *ServiceProvider) SignLogoutRequest(req *LogoutRequest) error {
+// GetSigningContext returns a dsig.SigningContext initialized based on the Service Provider's configuration
+func GetSigningContext(sp *ServiceProvider) (*dsig.SigningContext, error) {
 	keyPair := tls.Certificate{
 		Certificate: [][]byte{sp.Certificate.Raw},
 		PrivateKey:  sp.Key,
@@ -1173,420 +1267,65 @@ func (sp *ServiceProvider) SignLogoutRequest(req *LogoutRequest) error {
 	if sp.SignatureMethod != dsig.RSASHA1SignatureMethod &&
 		sp.SignatureMethod != dsig.RSASHA256SignatureMethod &&
 		sp.SignatureMethod != dsig.RSASHA512SignatureMethod {
-		return fmt.Errorf("invalid signing method %s", sp.SignatureMethod)
+		return nil, fmt.Errorf("invalid signing method %s", sp.SignatureMethod)
 	}
 	signatureMethod := sp.SignatureMethod
 	signingContext := dsig.NewDefaultSigningContext(keyStore)
 	signingContext.Canonicalizer = dsig.MakeC14N10ExclusiveCanonicalizerWithPrefixList(canonicalizerPrefixList)
 	if err := signingContext.SetSignatureMethod(signatureMethod); err != nil {
-		return err
+		return nil, err
 	}
 
-	assertionEl := req.Element()
-
-	signedRequestEl, err := signingContext.SignEnveloped(assertionEl)
-	if err != nil {
-		return err
-	}
-
-	sigEl := signedRequestEl.Child[len(signedRequestEl.Child)-1]
-	req.Signature = sigEl.(*etree.Element)
-	return nil
+	return signingContext, nil
 }
 
-// MakeLogoutRequest produces a new LogoutRequest object for idpURL.
-func (sp *ServiceProvider) MakeLogoutRequest(idpURL, nameID string) (*LogoutRequest, error) {
+// InvalidResponseError is the error produced by ParseResponse when it fails.
+// The underlying error is in PrivateErr. Response is the response as it was
+// known at the time validation failed. Now is the time that was used to validate
+// time-dependent parts of the assertion.
+type InvalidResponseError struct {
+	PrivateErr error
+	Response   string
+	Now        time.Time
+}
 
-	req := LogoutRequest{
-		ID:           fmt.Sprintf("id-%x", randomBytes(20)),
-		IssueInstant: TimeNow(),
-		Version:      "2.0",
-		Destination:  idpURL,
-		Issuer: &Issuer{
-			Format: "urn:oasis:names:tc:SAML:2.0:nameid-format:entity",
-			Value:  firstSet(sp.EntityID, sp.MetadataURL.String()),
-		},
-		NameID: &NameID{
-			Format:          sp.nameIDFormat(),
-			Value:           nameID,
-			NameQualifier:   sp.IDPMetadata.EntityID,
-			SPNameQualifier: sp.Metadata().EntityID,
-		},
-	}
-	if len(sp.SignatureMethod) > 0 {
-		if err := sp.SignLogoutRequest(&req); err != nil {
-			return nil, err
+func (ivr *InvalidResponseError) Error() string {
+	return "Authentication failed"
+}
+
+// ErrBadStatus is returned when the assertion provided is valid but the
+// status code is not "urn:oasis:names:tc:SAML:2.0:status:Success".
+type ErrBadStatus struct {
+	Status string
+}
+
+func (e ErrBadStatus) Error() string {
+	return e.Status
+}
+
+// AssertionAttributes is a list of AssertionAttribute
+type AssertionAttributes []AssertionAttribute
+
+// Get returns the assertion attribute whose Name or FriendlyName
+// matches name, or nil if no matching attribute is found.
+func (aa AssertionAttributes) Get(name string) *AssertionAttribute {
+	for _, attr := range aa {
+		if attr.Name == name {
+			return &attr
+		}
+		if attr.FriendlyName == name {
+			return &attr
 		}
 	}
-	return &req, nil
-}
-
-// MakeRedirectLogoutRequest creates a SAML authentication request using
-// the HTTP-Redirect binding. It returns a URL that we will redirect the user to
-// in order to start the auth process.
-func (sp *ServiceProvider) MakeRedirectLogoutRequest(nameID, relayState string) (*url.URL, error) {
-	req, err := sp.MakeLogoutRequest(sp.GetSLOBindingLocation(HTTPRedirectBinding), nameID)
-	if err != nil {
-		return nil, err
-	}
-	return req.Redirect(relayState), nil
-}
-
-// Redirect returns a URL suitable for using the redirect binding with the request
-func (r *LogoutRequest) Redirect(relayState string) *url.URL {
-	w := &bytes.Buffer{}
-	w1 := base64.NewEncoder(base64.StdEncoding, w)
-	w2, _ := flate.NewWriter(w1, 9)
-	doc := etree.NewDocument()
-	doc.SetRoot(r.Element())
-	if _, err := doc.WriteTo(w2); err != nil {
-		panic(err)
-	}
-	if err := w2.Close(); err != nil {
-		panic(err)
-	}
-	if err := w1.Close(); err != nil {
-		panic(err)
-	}
-
-	rv, _ := url.Parse(r.Destination)
-
-	query := rv.Query()
-	query.Set("SAMLRequest", w.String())
-	if relayState != "" {
-		query.Set("RelayState", relayState)
-	}
-	rv.RawQuery = query.Encode()
-
-	return rv
-}
-
-// MakePostLogoutRequest creates a SAML authentication request using
-// the HTTP-POST binding. It returns HTML text representing an HTML form that
-// can be sent presented to a browser to initiate the logout process.
-func (sp *ServiceProvider) MakePostLogoutRequest(nameID, relayState string) ([]byte, error) {
-	req, err := sp.MakeLogoutRequest(sp.GetSLOBindingLocation(HTTPPostBinding), nameID)
-	if err != nil {
-		return nil, err
-	}
-	return req.Post(relayState), nil
-}
-
-// Post returns an HTML form suitable for using the HTTP-POST binding with the request
-func (r *LogoutRequest) Post(relayState string) []byte {
-	doc := etree.NewDocument()
-	doc.SetRoot(r.Element())
-	reqBuf, err := doc.WriteToBytes()
-	if err != nil {
-		panic(err)
-	}
-	encodedReqBuf := base64.StdEncoding.EncodeToString(reqBuf)
-
-	tmpl := template.Must(template.New("saml-post-form").Parse(`` +
-		`<form method="post" action="{{.URL}}" id="SAMLRequestForm">` +
-		`<input type="hidden" name="SAMLRequest" value="{{.SAMLRequest}}" />` +
-		`<input type="hidden" name="RelayState" value="{{.RelayState}}" />` +
-		`<input id="SAMLSubmitButton" type="submit" value="Submit" />` +
-		`</form>` +
-		`<script>document.getElementById('SAMLSubmitButton').style.visibility="hidden";` +
-		`document.getElementById('SAMLRequestForm').submit();</script>`))
-	data := struct {
-		URL         string
-		SAMLRequest string
-		RelayState  string
-	}{
-		URL:         r.Destination,
-		SAMLRequest: encodedReqBuf,
-		RelayState:  relayState,
-	}
-
-	rv := bytes.Buffer{}
-	if err := tmpl.Execute(&rv, data); err != nil {
-		panic(err)
-	}
-
-	return rv.Bytes()
-}
-
-// MakeLogoutResponse produces a new LogoutResponse object for idpURL and logoutRequestID.
-func (sp *ServiceProvider) MakeLogoutResponse(idpURL, logoutRequestID string) (*LogoutResponse, error) {
-	response := LogoutResponse{
-		ID:           fmt.Sprintf("id-%x", randomBytes(20)),
-		InResponseTo: logoutRequestID,
-		Version:      "2.0",
-		IssueInstant: TimeNow(),
-		Destination:  idpURL,
-		Issuer: &Issuer{
-			Format: "urn:oasis:names:tc:SAML:2.0:nameid-format:entity",
-			Value:  firstSet(sp.EntityID, sp.MetadataURL.String()),
-		},
-		Status: Status{
-			StatusCode: StatusCode{
-				Value: StatusSuccess,
-			},
-		},
-	}
-
-	if len(sp.SignatureMethod) > 0 {
-		if err := sp.SignLogoutResponse(&response); err != nil {
-			return nil, err
-		}
-	}
-	return &response, nil
-}
-
-// MakeRedirectLogoutResponse creates a SAML LogoutResponse using
-// the HTTP-Redirect binding. It returns a URL that we will redirect the user to
-// for LogoutResponse.
-func (sp *ServiceProvider) MakeRedirectLogoutResponse(logoutRequestID, relayState string) (*url.URL, error) {
-	resp, err := sp.MakeLogoutResponse(sp.GetSLOBindingLocation(HTTPRedirectBinding), logoutRequestID)
-	if err != nil {
-		return nil, err
-	}
-	return resp.Redirect(relayState), nil
-}
-
-// Redirect returns a URL suitable for using the redirect binding with the LogoutResponse.
-func (r *LogoutResponse) Redirect(relayState string) *url.URL {
-	w := &bytes.Buffer{}
-	w1 := base64.NewEncoder(base64.StdEncoding, w)
-	w2, _ := flate.NewWriter(w1, 9)
-	doc := etree.NewDocument()
-	doc.SetRoot(r.Element())
-	if _, err := doc.WriteTo(w2); err != nil {
-		panic(err)
-	}
-	if err := w2.Close(); err != nil {
-		panic(err)
-	}
-	if err := w1.Close(); err != nil {
-		panic(err)
-	}
-
-	rv, _ := url.Parse(r.Destination)
-
-	query := rv.Query()
-	query.Set("SAMLResponse", w.String())
-	if relayState != "" {
-		query.Set("RelayState", relayState)
-	}
-	rv.RawQuery = query.Encode()
-
-	return rv
-}
-
-// MakePostLogoutResponse creates a SAML LogoutResponse using
-// the HTTP-POST binding. It returns HTML text representing an HTML form that
-// can be sent presented to a browser for LogoutResponse.
-func (sp *ServiceProvider) MakePostLogoutResponse(logoutRequestID, relayState string) ([]byte, error) {
-	resp, err := sp.MakeLogoutResponse(sp.GetSLOBindingLocation(HTTPPostBinding), logoutRequestID)
-	if err != nil {
-		return nil, err
-	}
-	return resp.Post(relayState), nil
-}
-
-// Post returns an HTML form suitable for using the HTTP-POST binding with the LogoutResponse.
-func (r *LogoutResponse) Post(relayState string) []byte {
-	doc := etree.NewDocument()
-	doc.SetRoot(r.Element())
-	reqBuf, err := doc.WriteToBytes()
-	if err != nil {
-		panic(err)
-	}
-	encodedReqBuf := base64.StdEncoding.EncodeToString(reqBuf)
-
-	tmpl := template.Must(template.New("saml-post-form").Parse(`` +
-		`<form method="post" action="{{.URL}}" id="SAMLResponseForm">` +
-		`<input type="hidden" name="SAMLResponse" value="{{.SAMLResponse}}" />` +
-		`<input type="hidden" name="RelayState" value="{{.RelayState}}" />` +
-		`<input id="SAMLSubmitButton" type="submit" value="Submit" />` +
-		`</form>` +
-		`<script>document.getElementById('SAMLSubmitButton').style.visibility="hidden";` +
-		`document.getElementById('SAMLResponseForm').submit();</script>`))
-	data := struct {
-		URL          string
-		SAMLResponse string
-		RelayState   string
-	}{
-		URL:          r.Destination,
-		SAMLResponse: encodedReqBuf,
-		RelayState:   relayState,
-	}
-
-	rv := bytes.Buffer{}
-	if err := tmpl.Execute(&rv, data); err != nil {
-		panic(err)
-	}
-
-	return rv.Bytes()
-}
-
-// SignLogoutResponse adds the `Signature` element to the `LogoutResponse`.
-func (sp *ServiceProvider) SignLogoutResponse(resp *LogoutResponse) error {
-	keyPair := tls.Certificate{
-		Certificate: [][]byte{sp.Certificate.Raw},
-		PrivateKey:  sp.Key,
-		Leaf:        sp.Certificate,
-	}
-	// TODO: add intermediates for SP
-	// for _, cert := range sp.Intermediates {
-	// 	keyPair.Certificate = append(keyPair.Certificate, cert.Raw)
-	// }
-	keyStore := dsig.TLSCertKeyStore(keyPair)
-
-	if sp.SignatureMethod != dsig.RSASHA1SignatureMethod &&
-		sp.SignatureMethod != dsig.RSASHA256SignatureMethod &&
-		sp.SignatureMethod != dsig.RSASHA512SignatureMethod {
-		return fmt.Errorf("invalid signing method %s", sp.SignatureMethod)
-	}
-	signatureMethod := sp.SignatureMethod
-	signingContext := dsig.NewDefaultSigningContext(keyStore)
-	signingContext.Canonicalizer = dsig.MakeC14N10ExclusiveCanonicalizerWithPrefixList(canonicalizerPrefixList)
-	if err := signingContext.SetSignatureMethod(signatureMethod); err != nil {
-		return err
-	}
-
-	assertionEl := resp.Element()
-
-	signedRequestEl, err := signingContext.SignEnveloped(assertionEl)
-	if err != nil {
-		return err
-	}
-
-	sigEl := signedRequestEl.Child[len(signedRequestEl.Child)-1]
-	resp.Signature = sigEl.(*etree.Element)
 	return nil
 }
 
-func (sp *ServiceProvider) nameIDFormat() string {
-	var nameIDFormat string
-	switch sp.AuthnNameIDFormat {
-	case "":
-		// To maintain library back-compat, use "transient" if unset.
-		nameIDFormat = string(TransientNameIDFormat)
-	case UnspecifiedNameIDFormat:
-		// Spec defines an empty value as "unspecified" so don't set one.
-	default:
-		nameIDFormat = string(sp.AuthnNameIDFormat)
-	}
-	return nameIDFormat
-}
-
-// ValidateLogoutResponseRequest validates the LogoutResponse content from the request
-func (sp *ServiceProvider) ValidateLogoutResponseRequest(req *http.Request) error {
-	if data := req.URL.Query().Get("SAMLResponse"); data != "" {
-		return sp.ValidateLogoutResponseRedirect(data)
-	}
-
-	err := req.ParseForm()
-	if err != nil {
-		return fmt.Errorf("unable to parse form: %v", err)
-	}
-
-	return sp.ValidateLogoutResponseForm(req.PostForm.Get("SAMLResponse"))
-}
-
-// ValidateLogoutResponseForm returns a nil error if the logout response is valid.
-func (sp *ServiceProvider) ValidateLogoutResponseForm(postFormData string) error {
-	retErr := &InvalidResponseError{
-		Now: TimeNow(),
-	}
-
-	rawResponseBuf, err := base64.StdEncoding.DecodeString(postFormData)
-	if err != nil {
-		retErr.PrivateErr = fmt.Errorf("unable to parse base64: %s", err)
-		return retErr
-	}
-	retErr.Response = string(rawResponseBuf)
-
-	// TODO(ross): add test case for this (SLO does not have tests right now)
-	if err := xrv.Validate(bytes.NewReader(rawResponseBuf)); err != nil {
-		return fmt.Errorf("response contains invalid XML: %s", err)
-	}
-
-	doc := etree.NewDocument()
-	if err := doc.ReadFromBytes(rawResponseBuf); err != nil {
-		retErr.PrivateErr = err
-		return retErr
-	}
-
-	if err := sp.validateSignature(doc.Root()); err != nil {
-		retErr.PrivateErr = err
-		return retErr
-	}
-
-	var resp LogoutResponse
-	if err := unmarshalElement(doc.Root(), &resp); err != nil {
-		retErr.PrivateErr = err
-		return retErr
-	}
-	return sp.validateLogoutResponse(&resp)
-}
-
-// ValidateLogoutResponseRedirect returns a nil error if the logout response is valid.
-//
-// URL Binding appears to be gzip / flate encoded
-// See https://www.oasis-open.org/committees/download.php/20645/sstc-saml-tech-overview-2%200-draft-10.pdf  6.6
-func (sp *ServiceProvider) ValidateLogoutResponseRedirect(queryParameterData string) error {
-	retErr := &InvalidResponseError{
-		Now: TimeNow(),
-	}
-
-	rawResponseBuf, err := base64.StdEncoding.DecodeString(queryParameterData)
-	if err != nil {
-		retErr.PrivateErr = fmt.Errorf("unable to parse base64: %s", err)
-		return retErr
-	}
-	retErr.Response = string(rawResponseBuf)
-
-	gr, err := io.ReadAll(newSaferFlateReader(bytes.NewBuffer(rawResponseBuf)))
-	if err != nil {
-		retErr.PrivateErr = err
-		return retErr
-	}
-
-	if err := xrv.Validate(bytes.NewReader(gr)); err != nil {
-		return err
-	}
-
-	doc := etree.NewDocument()
-	if err := doc.ReadFromBytes(rawResponseBuf); err != nil {
-		retErr.PrivateErr = err
-		return retErr
-	}
-
-	if err := sp.validateSignature(doc.Root()); err != nil {
-		retErr.PrivateErr = err
-		return retErr
-	}
-
-	var resp LogoutResponse
-	if err := unmarshalElement(doc.Root(), &resp); err != nil {
-		retErr.PrivateErr = err
-		return retErr
-	}
-	return sp.validateLogoutResponse(&resp)
-}
-
-// validateLogoutResponse validates the LogoutResponse fields. Returns a nil error if the LogoutResponse is valid.
-func (sp *ServiceProvider) validateLogoutResponse(resp *LogoutResponse) error {
-	if resp.Destination != sp.SloURL.String() {
-		return fmt.Errorf("`Destination` does not match SloURL (expected %q)", sp.SloURL.String())
-	}
-
-	now := time.Now()
-	if resp.IssueInstant.Add(MaxIssueDelay).Before(now) {
-		return fmt.Errorf("issueInstant expired at %s", resp.IssueInstant.Add(MaxIssueDelay))
-	}
-	if resp.Issuer.Value != sp.IDPMetadata.EntityID {
-		return fmt.Errorf("issuer does not match the IDP metadata (expected %q)", sp.IDPMetadata.EntityID)
-	}
-	if resp.Status.StatusCode.Value != StatusSuccess {
-		return fmt.Errorf("status code was not %s", StatusSuccess)
-	}
-
-	return nil
+// AssertionAttribute represents an attribute of the user extracted from
+// a SAML Assertion.
+type AssertionAttribute struct {
+	FriendlyName string
+	Name         string
+	Value        string
 }
 
 func firstSet(a, b string) string {

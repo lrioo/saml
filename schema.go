@@ -3,13 +3,19 @@ package saml
 import (
 	"bytes"
 	"compress/flate"
+	"encoding/base64"
 	"encoding/xml"
+	"html/template"
+	"net/url"
 	"strconv"
 	"time"
 
 	"github.com/beevik/etree"
 	"github.com/russellhaering/goxmldsig/etreeutils"
 )
+
+type Request interface {
+}
 
 // RequestedAuthnContext represents the SAML object of the same name, an indication of the
 // requirements on the authentication process.
@@ -57,6 +63,179 @@ type AuthnRequest struct {
 	ProtocolBinding                string `xml:",attr"`
 	AttributeConsumingServiceIndex string `xml:",attr"`
 	ProviderName                   string `xml:",attr"`
+}
+
+// Element returns an etree.Element representing the object in XML form.
+func (r *AuthnRequest) Element() *etree.Element {
+	el := etree.NewElement("samlp:AuthnRequest")
+	el.CreateAttr("xmlns:saml", "urn:oasis:names:tc:SAML:2.0:assertion")
+	el.CreateAttr("xmlns:samlp", "urn:oasis:names:tc:SAML:2.0:protocol")
+	el.CreateAttr("ID", r.ID)
+	el.CreateAttr("Version", r.Version)
+	el.CreateAttr("IssueInstant", r.IssueInstant.Format(timeFormat))
+	if r.Destination != "" {
+		el.CreateAttr("Destination", r.Destination)
+	}
+	if r.Consent != "" {
+		el.CreateAttr("Consent", r.Consent)
+	}
+	if r.Issuer != nil {
+		el.AddChild(r.Issuer.Element())
+	}
+	if r.Signature != nil {
+		el.AddChild(r.Signature)
+	}
+	if r.Subject != nil {
+		el.AddChild(r.Subject.Element())
+	}
+	if r.NameIDPolicy != nil {
+		el.AddChild(r.NameIDPolicy.Element())
+	}
+	if r.Conditions != nil {
+		el.AddChild(r.Conditions.Element())
+	}
+	if r.RequestedAuthnContext != nil {
+		el.AddChild(r.RequestedAuthnContext.Element())
+	}
+	// if r.Scoping != nil {
+	// 	el.AddChild(r.Scoping.Element())
+	// }
+	if r.ForceAuthn != nil {
+		el.CreateAttr("ForceAuthn", strconv.FormatBool(*r.ForceAuthn))
+	}
+	if r.IsPassive != nil {
+		el.CreateAttr("IsPassive", strconv.FormatBool(*r.IsPassive))
+	}
+	if r.AssertionConsumerServiceIndex != "" {
+		el.CreateAttr("AssertionConsumerServiceIndex", r.AssertionConsumerServiceIndex)
+	}
+	if r.AssertionConsumerServiceURL != "" {
+		el.CreateAttr("AssertionConsumerServiceURL", r.AssertionConsumerServiceURL)
+	}
+	if r.ProtocolBinding != "" {
+		el.CreateAttr("ProtocolBinding", r.ProtocolBinding)
+	}
+	if r.AttributeConsumingServiceIndex != "" {
+		el.CreateAttr("AttributeConsumingServiceIndex", r.AttributeConsumingServiceIndex)
+	}
+	if r.ProviderName != "" {
+		el.CreateAttr("ProviderName", r.ProviderName)
+	}
+	return el
+}
+
+// MarshalXML implements xml.Marshaler
+func (r *AuthnRequest) MarshalXML(e *xml.Encoder, _ xml.StartElement) error {
+	type Alias AuthnRequest
+	aux := &struct {
+		IssueInstant RelaxedTime `xml:",attr"`
+		*Alias
+	}{
+		IssueInstant: RelaxedTime(r.IssueInstant),
+		Alias:        (*Alias)(r),
+	}
+	return e.Encode(aux)
+}
+
+// UnmarshalXML implements xml.Unmarshaler
+func (r *AuthnRequest) UnmarshalXML(d *xml.Decoder, start xml.StartElement) error {
+	type Alias AuthnRequest
+	aux := &struct {
+		IssueInstant RelaxedTime `xml:",attr"`
+		*Alias
+	}{
+		Alias: (*Alias)(r),
+	}
+	if err := d.DecodeElement(&aux, &start); err != nil {
+		return err
+	}
+	r.IssueInstant = time.Time(aux.IssueInstant)
+	return nil
+}
+
+// Redirect returns a URL suitable for using the redirect binding with the request
+func (r *AuthnRequest) Redirect(relayState string, sp *ServiceProvider) (*url.URL, error) {
+	w := &bytes.Buffer{}
+	w1 := base64.NewEncoder(base64.StdEncoding, w)
+	w2, _ := flate.NewWriter(w1, 9)
+	doc := etree.NewDocument()
+	doc.SetRoot(r.Element())
+	if _, err := doc.WriteTo(w2); err != nil {
+		panic(err)
+	}
+	if err := w2.Close(); err != nil {
+		panic(err)
+	}
+	if err := w1.Close(); err != nil {
+		panic(err)
+	}
+
+	rv, _ := url.Parse(r.Destination)
+	// We can't depend on Query().set() as order matters for signing
+	query := rv.RawQuery
+	if len(query) > 0 {
+		query += "&SAMLRequest=" + url.QueryEscape(w.String())
+	} else {
+		query += "SAMLRequest=" + url.QueryEscape(w.String())
+	}
+
+	if relayState != "" {
+		query += "&RelayState=" + relayState
+	}
+	if len(sp.SignatureMethod) > 0 {
+		query += "&SigAlg=" + url.QueryEscape(sp.SignatureMethod)
+		signingContext, err := GetSigningContext(sp)
+
+		if err != nil {
+			return nil, err
+		}
+
+		sig, err := signingContext.SignString(query)
+		if err != nil {
+			return nil, err
+		}
+		query += "&Signature=" + url.QueryEscape(base64.StdEncoding.EncodeToString(sig))
+	}
+
+	rv.RawQuery = query
+
+	return rv, nil
+}
+
+// Post returns an HTML form suitable for using the HTTP-POST binding with the request
+func (r *AuthnRequest) Post(relayState string) []byte {
+	doc := etree.NewDocument()
+	doc.SetRoot(r.Element())
+	reqBuf, err := doc.WriteToBytes()
+	if err != nil {
+		panic(err)
+	}
+	encodedReqBuf := base64.StdEncoding.EncodeToString(reqBuf)
+
+	tmpl := template.Must(template.New("saml-post-form").Parse(`` +
+		`<form method="post" action="{{.URL}}" id="SAMLRequestForm">` +
+		`<input type="hidden" name="SAMLRequest" value="{{.SAMLRequest}}" />` +
+		`<input type="hidden" name="RelayState" value="{{.RelayState}}" />` +
+		`<input id="SAMLSubmitButton" type="submit" value="Submit" />` +
+		`</form>` +
+		`<script>document.getElementById('SAMLSubmitButton').style.visibility="hidden";` +
+		`document.getElementById('SAMLRequestForm').submit();</script>`))
+	data := struct {
+		URL         string
+		SAMLRequest string
+		RelayState  string
+	}{
+		URL:         r.Destination,
+		SAMLRequest: encodedReqBuf,
+		RelayState:  relayState,
+	}
+
+	rv := bytes.Buffer{}
+	if err := tmpl.Execute(&rv, data); err != nil {
+		panic(err)
+	}
+
+	return rv.Bytes()
 }
 
 // LogoutRequest  represents the SAML object of the same name, a request from an IDP
@@ -177,92 +356,88 @@ func (r *LogoutRequest) Deflate() ([]byte, error) {
 	return b.Bytes(), nil
 }
 
-// Element returns an etree.Element representing the object in XML form.
-func (r *AuthnRequest) Element() *etree.Element {
-	el := etree.NewElement("samlp:AuthnRequest")
-	el.CreateAttr("xmlns:saml", "urn:oasis:names:tc:SAML:2.0:assertion")
-	el.CreateAttr("xmlns:samlp", "urn:oasis:names:tc:SAML:2.0:protocol")
-	el.CreateAttr("ID", r.ID)
-	el.CreateAttr("Version", r.Version)
-	el.CreateAttr("IssueInstant", r.IssueInstant.Format(timeFormat))
-	if r.Destination != "" {
-		el.CreateAttr("Destination", r.Destination)
+// Redirect returns a URL suitable for using the redirect binding with the request
+func (r *LogoutRequest) Redirect(relayState string, sp *ServiceProvider) *url.URL {
+	w := &bytes.Buffer{}
+	w1 := base64.NewEncoder(base64.StdEncoding, w)
+	w2, _ := flate.NewWriter(w1, 9)
+	doc := etree.NewDocument()
+	doc.SetRoot(r.Element())
+	if _, err := doc.WriteTo(w2); err != nil {
+		panic(err)
 	}
-	if r.Consent != "" {
-		el.CreateAttr("Consent", r.Consent)
+	if err := w2.Close(); err != nil {
+		panic(err)
 	}
-	if r.Issuer != nil {
-		el.AddChild(r.Issuer.Element())
+	if err := w1.Close(); err != nil {
+		panic(err)
 	}
-	if r.Signature != nil {
-		el.AddChild(r.Signature)
+
+	rv, _ := url.Parse(r.Destination)
+	// We can't depend on Query().set() as order matters for signing
+	query := rv.RawQuery
+	if len(query) > 0 {
+		query += "&SAMLRequest=" + url.QueryEscape(w.String())
+	} else {
+		query += "SAMLRequest=" + url.QueryEscape(w.String())
 	}
-	if r.Subject != nil {
-		el.AddChild(r.Subject.Element())
+
+	if relayState != "" {
+		query += "&RelayState=" + relayState
 	}
-	if r.NameIDPolicy != nil {
-		el.AddChild(r.NameIDPolicy.Element())
+	if len(sp.SignatureMethod) > 0 {
+		query += "&SigAlg=" + url.QueryEscape(sp.SignatureMethod)
+		signingContext, err := GetSigningContext(sp)
+
+		if err != nil {
+			return nil
+		}
+
+		sig, err := signingContext.SignString(query)
+		if err != nil {
+			return nil
+		}
+		query += "&Signature=" + url.QueryEscape(base64.StdEncoding.EncodeToString(sig))
 	}
-	if r.Conditions != nil {
-		el.AddChild(r.Conditions.Element())
-	}
-	if r.RequestedAuthnContext != nil {
-		el.AddChild(r.RequestedAuthnContext.Element())
-	}
-	// if r.Scoping != nil {
-	// 	el.AddChild(r.Scoping.Element())
-	// }
-	if r.ForceAuthn != nil {
-		el.CreateAttr("ForceAuthn", strconv.FormatBool(*r.ForceAuthn))
-	}
-	if r.IsPassive != nil {
-		el.CreateAttr("IsPassive", strconv.FormatBool(*r.IsPassive))
-	}
-	if r.AssertionConsumerServiceIndex != "" {
-		el.CreateAttr("AssertionConsumerServiceIndex", r.AssertionConsumerServiceIndex)
-	}
-	if r.AssertionConsumerServiceURL != "" {
-		el.CreateAttr("AssertionConsumerServiceURL", r.AssertionConsumerServiceURL)
-	}
-	if r.ProtocolBinding != "" {
-		el.CreateAttr("ProtocolBinding", r.ProtocolBinding)
-	}
-	if r.AttributeConsumingServiceIndex != "" {
-		el.CreateAttr("AttributeConsumingServiceIndex", r.AttributeConsumingServiceIndex)
-	}
-	if r.ProviderName != "" {
-		el.CreateAttr("ProviderName", r.ProviderName)
-	}
-	return el
+
+	rv.RawQuery = query
+	return rv
 }
 
-// MarshalXML implements xml.Marshaler
-func (r *AuthnRequest) MarshalXML(e *xml.Encoder, _ xml.StartElement) error {
-	type Alias AuthnRequest
-	aux := &struct {
-		IssueInstant RelaxedTime `xml:",attr"`
-		*Alias
-	}{
-		IssueInstant: RelaxedTime(r.IssueInstant),
-		Alias:        (*Alias)(r),
+// Post returns an HTML form suitable for using the HTTP-POST binding with the request
+func (r *LogoutRequest) Post(relayState string) []byte {
+	doc := etree.NewDocument()
+	doc.SetRoot(r.Element())
+	reqBuf, err := doc.WriteToBytes()
+	if err != nil {
+		panic(err)
 	}
-	return e.Encode(aux)
-}
+	encodedReqBuf := base64.StdEncoding.EncodeToString(reqBuf)
 
-// UnmarshalXML implements xml.Unmarshaler
-func (r *AuthnRequest) UnmarshalXML(d *xml.Decoder, start xml.StartElement) error {
-	type Alias AuthnRequest
-	aux := &struct {
-		IssueInstant RelaxedTime `xml:",attr"`
-		*Alias
+	tmpl := template.Must(template.New("saml-post-form").Parse(`` +
+		`<form method="post" action="{{.URL}}" id="SAMLRequestForm">` +
+		`<input type="hidden" name="SAMLRequest" value="{{.SAMLRequest}}" />` +
+		`<input type="hidden" name="RelayState" value="{{.RelayState}}" />` +
+		`<input id="SAMLSubmitButton" type="submit" value="Submit" />` +
+		`</form>` +
+		`<script>document.getElementById('SAMLSubmitButton').style.visibility="hidden";` +
+		`document.getElementById('SAMLRequestForm').submit();</script>`))
+	data := struct {
+		URL         string
+		SAMLRequest string
+		RelayState  string
 	}{
-		Alias: (*Alias)(r),
+		URL:         r.Destination,
+		SAMLRequest: encodedReqBuf,
+		RelayState:  relayState,
 	}
-	if err := d.DecodeElement(&aux, &start); err != nil {
-		return err
+
+	rv := bytes.Buffer{}
+	if err := tmpl.Execute(&rv, data); err != nil {
+		panic(err)
 	}
-	r.IssueInstant = time.Time(aux.IssueInstant)
-	return nil
+
+	return rv.Bytes()
 }
 
 // Issuer represents the SAML object of the same name.
@@ -1318,4 +1493,88 @@ func (r *LogoutResponse) UnmarshalXML(d *xml.Decoder, start xml.StartElement) er
 	}
 	r.IssueInstant = time.Time(aux.IssueInstant)
 	return nil
+}
+
+// Redirect returns a URL suitable for using the redirect binding with the LogoutResponse.
+func (r *LogoutResponse) Redirect(relayState string, sp *ServiceProvider) *url.URL {
+	w := &bytes.Buffer{}
+	w1 := base64.NewEncoder(base64.StdEncoding, w)
+	w2, _ := flate.NewWriter(w1, 9)
+	doc := etree.NewDocument()
+	doc.SetRoot(r.Element())
+	if _, err := doc.WriteTo(w2); err != nil {
+		panic(err)
+	}
+	if err := w2.Close(); err != nil {
+		panic(err)
+	}
+	if err := w1.Close(); err != nil {
+		panic(err)
+	}
+
+	rv, _ := url.Parse(r.Destination)
+	// We can't depend on Query().set() as order matters for signing
+	query := rv.RawQuery
+	if len(query) > 0 {
+		query += "&SAMLRequest=" + url.QueryEscape(w.String())
+	} else {
+		query += "SAMLRequest=" + url.QueryEscape(w.String())
+	}
+
+	if relayState != "" {
+		query += "&RelayState=" + relayState
+	}
+	if len(sp.SignatureMethod) > 0 {
+		query += "&SigAlg=" + url.QueryEscape(sp.SignatureMethod)
+		signingContext, err := GetSigningContext(sp)
+
+		if err != nil {
+			return nil
+		}
+
+		sig, err := signingContext.SignString(query)
+		if err != nil {
+			return nil
+		}
+		query += "&Signature=" + url.QueryEscape(base64.StdEncoding.EncodeToString(sig))
+	}
+
+	rv.RawQuery = query
+	return rv
+}
+
+// Post returns an HTML form suitable for using the HTTP-POST binding with the LogoutResponse.
+func (r *LogoutResponse) Post(relayState string) []byte {
+	doc := etree.NewDocument()
+	doc.SetRoot(r.Element())
+	reqBuf, err := doc.WriteToBytes()
+	if err != nil {
+		panic(err)
+	}
+	encodedReqBuf := base64.StdEncoding.EncodeToString(reqBuf)
+
+	tmpl := template.Must(template.New("saml-post-form").Parse(`` +
+		`<form method="post" action="{{.URL}}" id="SAMLResponseForm">` +
+		`<input type="hidden" name="SAMLResponse" value="{{.SAMLResponse}}" />` +
+		`<input type="hidden" name="RelayState" value="{{.RelayState}}" />` +
+		`<input id="SAMLSubmitButton" type="submit" value="Submit" />` +
+		`</form>` +
+		`<script>document.getElementById('SAMLSubmitButton').style.visibility="hidden";` +
+		`document.getElementById('SAMLResponseForm').submit();</script>`))
+	data := struct {
+		URL          string
+		SAMLResponse string
+		RelayState   string
+	}{
+		URL:          r.Destination,
+		SAMLResponse: encodedReqBuf,
+		RelayState:   relayState,
+	}
+
+	rv := bytes.Buffer{}
+	if err := tmpl.Execute(&rv, data); err != nil {
+		panic(err)
+	}
+
+	return rv.Bytes()
 }

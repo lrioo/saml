@@ -96,18 +96,16 @@ func DefaultServiceProvider(opts Options) saml.ServiceProvider {
 	sloURL := opts.URL.ResolveReference(&url.URL{Path: "saml/slo"})
 
 	var forceAuthn *bool
+	signatureMethod := dsig.RSASHA256SignatureMethod
 	if opts.ForceAuthn {
 		forceAuthn = &opts.ForceAuthn
 	}
-	signatureMethod := dsig.RSASHA1SignatureMethod
 	if !opts.SignRequest {
 		signatureMethod = ""
 	}
-
 	if opts.DefaultRedirectURI == "" {
 		opts.DefaultRedirectURI = "/"
 	}
-
 	if len(opts.LogoutBindings) == 0 {
 		opts.LogoutBindings = []string{saml.HTTPPostBinding}
 	}
@@ -145,10 +143,11 @@ func New(opts Options) (*Middleware, error) {
 		OnError:         DefaultOnError,
 		Session:         DefaultSessionProvider(opts),
 	}
-	m.RequestTracker = DefaultRequestTracker(opts, &m.ServiceProvider)
 	if opts.UseArtifactResponse {
 		m.ResponseBinding = saml.HTTPArtifactBinding
 	}
+
+	m.RequestTracker = DefaultRequestTracker(opts, &m.ServiceProvider)
 
 	return m, nil
 }
