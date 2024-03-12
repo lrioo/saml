@@ -73,7 +73,7 @@ func (t CookieRequestTracker) StopTrackingRequest(w http.ResponseWriter, r *http
 
 // GetTrackedRequests returns all the pending tracked requests
 func (t CookieRequestTracker) GetTrackedRequests(r *http.Request) []TrackedRequest {
-	rv := []TrackedRequest{}
+	var rv []TrackedRequest
 	for _, cookie := range r.Cookies() {
 		if !strings.HasPrefix(cookie.Name, t.NamePrefix) {
 			continue

@@ -48,7 +48,6 @@ func (c JWTSessionCodec) New(assertion *saml.Assertion) (Session, error) {
 	}
 
 	claims.Attributes = map[string][]string{}
-
 	for _, attributeStatement := range assertion.AttributeStatements {
 		for _, attr := range attributeStatement.Attributes {
 			claimName := attr.FriendlyName
