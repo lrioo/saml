@@ -11,11 +11,25 @@ import (
 // Session is an interface implemented to contain a session.
 type Session interface{}
 
+// SessionWithNameID is a session that can expose the
+// nameid provided by the SAML identity provider.
+type SessionWithNameID interface {
+	Session
+	GetNameID() string
+}
+
 // SessionWithAttributes is a session that can expose the
 // attributes provided by the SAML identity provider.
 type SessionWithAttributes interface {
 	Session
 	GetAttributes() Attributes
+}
+
+// SessionWithInfo is a session that can expose the
+// info provided by the SAML identity provider.
+type SessionWithInfo interface {
+	SessionWithNameID
+	SessionWithAttributes
 }
 
 // ErrNoSession is the error returned when the remote user does not have a session

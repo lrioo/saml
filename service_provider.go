@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"sync"
 	"time"
 
 	"github.com/beevik/etree"
@@ -146,6 +147,9 @@ type ServiceProvider struct {
 	// LogoutBindings specify the bindings available for SLO endpoint. If empty,
 	// HTTP-POST binding is used.
 	LogoutBindings []string
+
+	once     sync.Once
+	idpCerts []*x509.Certificate
 }
 
 func (sp *ServiceProvider) nameIDFormat() string {
@@ -165,8 +169,20 @@ func (sp *ServiceProvider) nameIDFormat() string {
 // getIDPSigningCerts returns the certificates which we can use to verify things
 // signed by the IDP in PEM format, or nil if no such certificate is found.
 func (sp *ServiceProvider) getIDPSigningCerts() ([]*x509.Certificate, error) {
-	var certStrings []string
+	sp.once.Do(func() {
+		_ = sp.parseIDPSigningCerts()
+	})
 
+	if len(sp.idpCerts) == 0 {
+		return nil, errors.New("cannot find valid signing certificate")
+	}
+	return sp.idpCerts, nil
+}
+
+// parseIDPSigningCerts returns the certificates which we can use to verify things
+// signed by the IDP in PEM format, or nil if no such certificate is found.
+func (sp *ServiceProvider) parseIDPSigningCerts() error {
+	var certStrings []string
 	// We need to include non-empty certs where the "use" attribute is
 	// either set to "signing" or is missing
 	for _, idpSSODescriptor := range sp.IDPMetadata.IDPSSODescriptors {
@@ -183,7 +199,7 @@ func (sp *ServiceProvider) getIDPSigningCerts() ([]*x509.Certificate, error) {
 	}
 
 	if len(certStrings) == 0 {
-		return nil, errors.New("cannot find any signing certificate in the IDP SSO descriptor")
+		return errors.New("cannot find any signing certificate in the IDP SSO descriptor")
 	}
 
 	certs := make([]*x509.Certificate, len(certStrings))
@@ -194,17 +210,18 @@ func (sp *ServiceProvider) getIDPSigningCerts() ([]*x509.Certificate, error) {
 		certStr = regex.ReplaceAllString(certStr, "")
 		certBytes, err := base64.StdEncoding.DecodeString(certStr)
 		if err != nil {
-			return nil, fmt.Errorf("cannot parse certificate: %s", err)
+			return fmt.Errorf("cannot parse certificate: %s", err)
 		}
 
 		parsedCert, err := x509.ParseCertificate(certBytes)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		certs[i] = parsedCert
 	}
 
-	return certs, nil
+	sp.idpCerts = certs
+	return nil
 }
 
 // Metadata returns the service provider metadata
@@ -358,13 +375,12 @@ func (sp *ServiceProvider) MakePostAuthenticationRequest(relayState string) ([]b
 	if err != nil {
 		return nil, err
 	}
-	return req.Post(relayState), nil
+	return req.Post(relayState)
 }
 
 // MakeAuthenticationRequest produces a new AuthnRequest object to send to the idpURL
 // that uses the specified binding (HTTPRedirectBinding or HTTPPostBinding)
 func (sp *ServiceProvider) MakeAuthenticationRequest(idpURL string, binding string, resultBinding string) (*AuthnRequest, error) {
-
 	allowCreate := true
 	nameIDFormat := sp.nameIDFormat()
 	req := AuthnRequest{
@@ -418,27 +434,27 @@ func (sp *ServiceProvider) SignAuthnRequest(req *AuthnRequest) error {
 // the HTTP-Redirect binding. It returns a URL that we will redirect the user to
 // in order to start the auth process.
 func (sp *ServiceProvider) MakeRedirectLogoutRequest(nameID, relayState string) (*url.URL, error) {
-	req, err := sp.MakeLogoutRequest(sp.GetSLOBindingLocation(HTTPRedirectBinding), nameID)
+	req, err := sp.MakeLogoutRequest(sp.GetSLOBindingLocation(HTTPRedirectBinding), HTTPRedirectBinding, nameID)
 	if err != nil {
 		return nil, err
 	}
-	return req.Redirect(relayState, sp), nil
+	return req.Redirect(relayState, sp)
 }
 
 // MakePostLogoutRequest creates a SAML authentication request using
 // the HTTP-POST binding. It returns HTML text representing an HTML form that
 // can be sent presented to a browser to initiate the logout process.
 func (sp *ServiceProvider) MakePostLogoutRequest(nameID, relayState string) ([]byte, error) {
-	req, err := sp.MakeLogoutRequest(sp.GetSLOBindingLocation(HTTPPostBinding), nameID)
+	req, err := sp.MakeLogoutRequest(sp.GetSLOBindingLocation(HTTPPostBinding), HTTPPostBinding, nameID)
 	if err != nil {
 		return nil, err
 	}
-	return req.Post(relayState), nil
+	return req.Post(relayState)
 }
 
 // MakeLogoutRequest produces a new LogoutRequest object for idpURL.
-func (sp *ServiceProvider) MakeLogoutRequest(idpURL, nameID string) (*LogoutRequest, error) {
-
+func (sp *ServiceProvider) MakeLogoutRequest(idpURL, binding, nameID string) (*LogoutRequest, error) {
+	entityID := firstSet(sp.EntityID, sp.MetadataURL.String())
 	req := LogoutRequest{
 		ID:           fmt.Sprintf("id-%x", randomBytes(20)),
 		IssueInstant: TimeNow(),
@@ -446,16 +462,18 @@ func (sp *ServiceProvider) MakeLogoutRequest(idpURL, nameID string) (*LogoutRequ
 		Destination:  idpURL,
 		Issuer: &Issuer{
 			Format: "urn:oasis:names:tc:SAML:2.0:nameid-format:entity",
-			Value:  firstSet(sp.EntityID, sp.MetadataURL.String()),
+			Value:  entityID,
 		},
 		NameID: &NameID{
 			Format:          sp.nameIDFormat(),
 			Value:           nameID,
 			NameQualifier:   sp.IDPMetadata.EntityID,
-			SPNameQualifier: sp.Metadata().EntityID,
+			SPNameQualifier: entityID,
 		},
 	}
-	if len(sp.SignatureMethod) > 0 {
+
+	// We don't need to sign the XML document if the IDP uses HTTP-Redirect binding
+	if len(sp.SignatureMethod) > 0 && binding == HTTPPostBinding {
 		if err := sp.SignLogoutRequest(&req); err != nil {
 			return nil, err
 		}
@@ -484,26 +502,26 @@ func (sp *ServiceProvider) SignLogoutRequest(req *LogoutRequest) error {
 // the HTTP-Redirect binding. It returns a URL that we will redirect the user to
 // for LogoutResponse.
 func (sp *ServiceProvider) MakeRedirectLogoutResponse(logoutRequestID, relayState string) (*url.URL, error) {
-	resp, err := sp.MakeLogoutResponse(sp.GetSLOBindingLocation(HTTPRedirectBinding), logoutRequestID)
+	resp, err := sp.MakeLogoutResponse(sp.GetSLOBindingLocation(HTTPRedirectBinding), HTTPRedirectBinding, logoutRequestID)
 	if err != nil {
 		return nil, err
 	}
-	return resp.Redirect(relayState, sp), nil
+	return resp.Redirect(relayState, sp)
 }
 
 // MakePostLogoutResponse creates a SAML LogoutResponse using
 // the HTTP-POST binding. It returns HTML text representing an HTML form that
 // can be sent presented to a browser for LogoutResponse.
 func (sp *ServiceProvider) MakePostLogoutResponse(logoutRequestID, relayState string) ([]byte, error) {
-	resp, err := sp.MakeLogoutResponse(sp.GetSLOBindingLocation(HTTPPostBinding), logoutRequestID)
+	resp, err := sp.MakeLogoutResponse(sp.GetSLOBindingLocation(HTTPPostBinding), HTTPPostBinding, logoutRequestID)
 	if err != nil {
 		return nil, err
 	}
-	return resp.Post(relayState), nil
+	return resp.Post(relayState)
 }
 
 // MakeLogoutResponse produces a new LogoutResponse object for idpURL and logoutRequestID.
-func (sp *ServiceProvider) MakeLogoutResponse(idpURL, logoutRequestID string) (*LogoutResponse, error) {
+func (sp *ServiceProvider) MakeLogoutResponse(idpURL, binding, logoutRequestID string) (*LogoutResponse, error) {
 	response := LogoutResponse{
 		ID:           fmt.Sprintf("id-%x", randomBytes(20)),
 		InResponseTo: logoutRequestID,
@@ -521,7 +539,8 @@ func (sp *ServiceProvider) MakeLogoutResponse(idpURL, logoutRequestID string) (*
 		},
 	}
 
-	if len(sp.SignatureMethod) > 0 {
+	// We don't need to sign the XML document if the IDP uses HTTP-Redirect binding
+	if len(sp.SignatureMethod) > 0 && binding == HTTPPostBinding {
 		if err := sp.SignLogoutResponse(&response); err != nil {
 			return nil, err
 		}
@@ -1186,7 +1205,7 @@ func (sp *ServiceProvider) validateAssertion(assertion *Assertion, possibleReque
 	return nil
 }
 
-// validateSignature returns nil iff the Signature embedded in the element is valid
+// validateSignature returns nil if the Signature embedded in the element is valid
 func (sp *ServiceProvider) validateSignature(el *etree.Element) error {
 	sigEl, err := findChild(el, "http://www.w3.org/2000/09/xmldsig#", "Signature")
 	if err != nil {

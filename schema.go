@@ -14,7 +14,10 @@ import (
 	"github.com/russellhaering/goxmldsig/etreeutils"
 )
 
-type Request interface {
+// HTTPHandler ...
+type HTTPHandler interface {
+	Redirect(relayState string, sp *ServiceProvider) (*url.URL, error)
+	Post(relayState string) ([]byte, error)
 }
 
 // RequestedAuthnContext represents the SAML object of the same name, an indication of the
@@ -161,13 +164,13 @@ func (r *AuthnRequest) Redirect(relayState string, sp *ServiceProvider) (*url.UR
 	doc := etree.NewDocument()
 	doc.SetRoot(r.Element())
 	if _, err := doc.WriteTo(w2); err != nil {
-		panic(err)
+		return nil, err
 	}
 	if err := w2.Close(); err != nil {
-		panic(err)
+		return nil, err
 	}
 	if err := w1.Close(); err != nil {
-		panic(err)
+		return nil, err
 	}
 
 	rv, _ := url.Parse(r.Destination)
@@ -178,14 +181,12 @@ func (r *AuthnRequest) Redirect(relayState string, sp *ServiceProvider) (*url.UR
 	} else {
 		query += "SAMLRequest=" + url.QueryEscape(w.String())
 	}
-
 	if relayState != "" {
 		query += "&RelayState=" + relayState
 	}
 	if len(sp.SignatureMethod) > 0 {
 		query += "&SigAlg=" + url.QueryEscape(sp.SignatureMethod)
 		signingContext, err := GetSigningContext(sp)
-
 		if err != nil {
 			return nil, err
 		}
@@ -198,20 +199,20 @@ func (r *AuthnRequest) Redirect(relayState string, sp *ServiceProvider) (*url.UR
 	}
 
 	rv.RawQuery = query
-
 	return rv, nil
 }
 
 // Post returns an HTML form suitable for using the HTTP-POST binding with the request
-func (r *AuthnRequest) Post(relayState string) []byte {
+func (r *AuthnRequest) Post(relayState string) ([]byte, error) {
 	doc := etree.NewDocument()
 	doc.SetRoot(r.Element())
+
 	reqBuf, err := doc.WriteToBytes()
 	if err != nil {
-		panic(err)
+		return nil, err
 	}
-	encodedReqBuf := base64.StdEncoding.EncodeToString(reqBuf)
 
+	encodedReqBuf := base64.StdEncoding.EncodeToString(reqBuf)
 	tmpl := template.Must(template.New("saml-post-form").Parse(`` +
 		`<form method="post" action="{{.URL}}" id="SAMLRequestForm">` +
 		`<input type="hidden" name="SAMLRequest" value="{{.SAMLRequest}}" />` +
@@ -231,11 +232,11 @@ func (r *AuthnRequest) Post(relayState string) []byte {
 	}
 
 	rv := bytes.Buffer{}
-	if err := tmpl.Execute(&rv, data); err != nil {
-		panic(err)
+	if err = tmpl.Execute(&rv, data); err != nil {
+		return nil, err
 	}
 
-	return rv.Bytes()
+	return rv.Bytes(), nil
 }
 
 // LogoutRequest  represents the SAML object of the same name, a request from an IDP
@@ -328,7 +329,6 @@ func (r *LogoutRequest) Bytes() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-
 	return buf, nil
 }
 
@@ -344,33 +344,30 @@ func (r *LogoutRequest) Deflate() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	if _, err := writer.Write(buf); err != nil {
+	if _, err = writer.Write(buf); err != nil {
 		return nil, err
 	}
-
-	if err := writer.Close(); err != nil {
+	if err = writer.Close(); err != nil {
 		return nil, err
 	}
-
 	return b.Bytes(), nil
 }
 
 // Redirect returns a URL suitable for using the redirect binding with the request
-func (r *LogoutRequest) Redirect(relayState string, sp *ServiceProvider) *url.URL {
+func (r *LogoutRequest) Redirect(relayState string, sp *ServiceProvider) (*url.URL, error) {
 	w := &bytes.Buffer{}
 	w1 := base64.NewEncoder(base64.StdEncoding, w)
 	w2, _ := flate.NewWriter(w1, 9)
 	doc := etree.NewDocument()
 	doc.SetRoot(r.Element())
 	if _, err := doc.WriteTo(w2); err != nil {
-		panic(err)
+		return nil, err
 	}
 	if err := w2.Close(); err != nil {
-		panic(err)
+		return nil, err
 	}
 	if err := w1.Close(); err != nil {
-		panic(err)
+		return nil, err
 	}
 
 	rv, _ := url.Parse(r.Destination)
@@ -381,39 +378,38 @@ func (r *LogoutRequest) Redirect(relayState string, sp *ServiceProvider) *url.UR
 	} else {
 		query += "SAMLRequest=" + url.QueryEscape(w.String())
 	}
-
 	if relayState != "" {
 		query += "&RelayState=" + relayState
 	}
 	if len(sp.SignatureMethod) > 0 {
 		query += "&SigAlg=" + url.QueryEscape(sp.SignatureMethod)
 		signingContext, err := GetSigningContext(sp)
-
 		if err != nil {
-			return nil
+			return nil, err
 		}
 
 		sig, err := signingContext.SignString(query)
 		if err != nil {
-			return nil
+			return nil, err
 		}
 		query += "&Signature=" + url.QueryEscape(base64.StdEncoding.EncodeToString(sig))
 	}
 
 	rv.RawQuery = query
-	return rv
+	return rv, nil
 }
 
 // Post returns an HTML form suitable for using the HTTP-POST binding with the request
-func (r *LogoutRequest) Post(relayState string) []byte {
+func (r *LogoutRequest) Post(relayState string) ([]byte, error) {
 	doc := etree.NewDocument()
 	doc.SetRoot(r.Element())
+
 	reqBuf, err := doc.WriteToBytes()
 	if err != nil {
-		panic(err)
+		return nil, err
 	}
-	encodedReqBuf := base64.StdEncoding.EncodeToString(reqBuf)
 
+	encodedReqBuf := base64.StdEncoding.EncodeToString(reqBuf)
 	tmpl := template.Must(template.New("saml-post-form").Parse(`` +
 		`<form method="post" action="{{.URL}}" id="SAMLRequestForm">` +
 		`<input type="hidden" name="SAMLRequest" value="{{.SAMLRequest}}" />` +
@@ -433,11 +429,11 @@ func (r *LogoutRequest) Post(relayState string) []byte {
 	}
 
 	rv := bytes.Buffer{}
-	if err := tmpl.Execute(&rv, data); err != nil {
-		panic(err)
+	if err = tmpl.Execute(&rv, data); err != nil {
+		return nil, err
 	}
 
-	return rv.Bytes()
+	return rv.Bytes(), nil
 }
 
 // Issuer represents the SAML object of the same name.
@@ -1443,7 +1439,6 @@ func (r *LogoutResponse) Element() *etree.Element {
 	el := etree.NewElement("samlp:LogoutResponse")
 	el.CreateAttr("xmlns:saml", "urn:oasis:names:tc:SAML:2.0:assertion")
 	el.CreateAttr("xmlns:samlp", "urn:oasis:names:tc:SAML:2.0:protocol")
-
 	el.CreateAttr("ID", r.ID)
 	if r.InResponseTo != "" {
 		el.CreateAttr("InResponseTo", r.InResponseTo)
@@ -1496,20 +1491,20 @@ func (r *LogoutResponse) UnmarshalXML(d *xml.Decoder, start xml.StartElement) er
 }
 
 // Redirect returns a URL suitable for using the redirect binding with the LogoutResponse.
-func (r *LogoutResponse) Redirect(relayState string, sp *ServiceProvider) *url.URL {
+func (r *LogoutResponse) Redirect(relayState string, sp *ServiceProvider) (*url.URL, error) {
 	w := &bytes.Buffer{}
 	w1 := base64.NewEncoder(base64.StdEncoding, w)
 	w2, _ := flate.NewWriter(w1, 9)
 	doc := etree.NewDocument()
 	doc.SetRoot(r.Element())
 	if _, err := doc.WriteTo(w2); err != nil {
-		panic(err)
+		return nil, err
 	}
 	if err := w2.Close(); err != nil {
-		panic(err)
+		return nil, err
 	}
 	if err := w1.Close(); err != nil {
-		panic(err)
+		return nil, err
 	}
 
 	rv, _ := url.Parse(r.Destination)
@@ -1520,39 +1515,38 @@ func (r *LogoutResponse) Redirect(relayState string, sp *ServiceProvider) *url.U
 	} else {
 		query += "SAMLRequest=" + url.QueryEscape(w.String())
 	}
-
 	if relayState != "" {
 		query += "&RelayState=" + relayState
 	}
 	if len(sp.SignatureMethod) > 0 {
 		query += "&SigAlg=" + url.QueryEscape(sp.SignatureMethod)
 		signingContext, err := GetSigningContext(sp)
-
 		if err != nil {
-			return nil
+			return nil, err
 		}
 
 		sig, err := signingContext.SignString(query)
 		if err != nil {
-			return nil
+			return nil, err
 		}
 		query += "&Signature=" + url.QueryEscape(base64.StdEncoding.EncodeToString(sig))
 	}
 
 	rv.RawQuery = query
-	return rv
+	return rv, nil
 }
 
 // Post returns an HTML form suitable for using the HTTP-POST binding with the LogoutResponse.
-func (r *LogoutResponse) Post(relayState string) []byte {
+func (r *LogoutResponse) Post(relayState string) ([]byte, error) {
 	doc := etree.NewDocument()
 	doc.SetRoot(r.Element())
+
 	reqBuf, err := doc.WriteToBytes()
 	if err != nil {
-		panic(err)
+		return nil, err
 	}
-	encodedReqBuf := base64.StdEncoding.EncodeToString(reqBuf)
 
+	encodedReqBuf := base64.StdEncoding.EncodeToString(reqBuf)
 	tmpl := template.Must(template.New("saml-post-form").Parse(`` +
 		`<form method="post" action="{{.URL}}" id="SAMLResponseForm">` +
 		`<input type="hidden" name="SAMLResponse" value="{{.SAMLResponse}}" />` +
@@ -1572,9 +1566,9 @@ func (r *LogoutResponse) Post(relayState string) []byte {
 	}
 
 	rv := bytes.Buffer{}
-	if err := tmpl.Execute(&rv, data); err != nil {
-		panic(err)
+	if err = tmpl.Execute(&rv, data); err != nil {
+		return nil, err
 	}
 
-	return rv.Bytes()
+	return rv.Bytes(), nil
 }

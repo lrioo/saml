@@ -109,6 +109,8 @@ func (c JWTSessionCodec) Decode(signed string) (Session, error) {
 	return claims, nil
 }
 
+var _ Session = JWTSessionClaims{}
+
 // JWTSessionClaims represents the JWT claims in the encoded session
 type JWTSessionClaims struct {
 	jwt.RegisteredClaims
@@ -116,7 +118,10 @@ type JWTSessionClaims struct {
 	SAMLSession bool       `json:"saml-session"`
 }
 
-var _ Session = JWTSessionClaims{}
+// GetNameID implements SessionWithAttributes. It returns the SAMl nameID.
+func (c JWTSessionClaims) GetNameID() string {
+	return c.Subject
+}
 
 // GetAttributes implements SessionWithAttributes. It returns the SAMl attributes.
 func (c JWTSessionClaims) GetAttributes() Attributes {

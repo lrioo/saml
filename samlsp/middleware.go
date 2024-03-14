@@ -5,6 +5,7 @@ import (
 	"encoding/xml"
 	"errors"
 	"net/http"
+	"net/url"
 
 	"github.com/crewjam/saml"
 )
@@ -42,7 +43,7 @@ import (
 // to sign the JWTs as well.
 type Middleware struct {
 	ServiceProvider saml.ServiceProvider
-	OnError         func(w http.ResponseWriter, r *http.Request, err error)
+	OnError         ErrorFunction
 	Binding         string // either saml.HTTPPostBinding or saml.HTTPRedirectBinding
 	ResponseBinding string // either saml.HTTPPostBinding or saml.HTTPArtifactBinding
 	RequestTracker  RequestTracker
@@ -103,6 +104,70 @@ func (m *Middleware) ServeACS(w http.ResponseWriter, r *http.Request) {
 	m.CreateSessionFromAssertion(w, r, assertion, m.ServiceProvider.DefaultRedirectURI)
 }
 
+// CreateSessionFromAssertion is invoked by ServeHTTP when we have a new, valid SAML assertion.
+func (m *Middleware) CreateSessionFromAssertion(w http.ResponseWriter, r *http.Request, assertion *saml.Assertion, redirectURI string) {
+	if trackedRequestIndex := r.Form.Get("RelayState"); trackedRequestIndex != "" {
+		trackedRequest, err := m.RequestTracker.GetTrackedRequest(r, trackedRequestIndex)
+		if err != nil {
+			if errors.Is(err, http.ErrNoCookie) && m.ServiceProvider.AllowIDPInitiated {
+				if uri := r.Form.Get("RelayState"); uri != "" {
+					redirectURI = uri
+				}
+			} else {
+				m.OnError(w, r, err)
+				return
+			}
+		} else {
+			if err := m.RequestTracker.StopTrackingRequest(w, r, trackedRequestIndex); err != nil {
+				m.OnError(w, r, err)
+				return
+			}
+
+			redirectURI = trackedRequest.URI
+		}
+	}
+
+	if err := m.Session.CreateSession(w, r, assertion); err != nil {
+		m.OnError(w, r, err)
+		return
+	}
+
+	http.Redirect(w, r, redirectURI, http.StatusFound)
+}
+
+// ServeSLO handles requests for the SAML SLO endpoint.
+func (m *Middleware) ServeSLO(w http.ResponseWriter, r *http.Request) {
+	err := m.ServiceProvider.ValidateLogoutResponseRequest(r)
+	if err != nil {
+		m.OnError(w, r, err)
+		return
+	}
+
+	session, err := m.Session.GetSession(r)
+	if err != nil {
+		if errors.Is(err, ErrNoSession) {
+			w.WriteHeader(http.StatusOK)
+		} else {
+			m.OnError(w, r, err)
+		}
+		return
+	} else if session != nil {
+		r = r.WithContext(ContextWithSession(r.Context(), session))
+	}
+
+	for _, trackedRequest := range m.RequestTracker.GetTrackedRequests(r) {
+		if err = m.RequestTracker.StopTrackingRequest(w, r, trackedRequest.Index); err != nil {
+			break
+		}
+	}
+	if err = m.Session.DeleteSession(w, r); err != nil {
+		m.OnError(w, r, err)
+		return
+	}
+
+	http.Redirect(w, r, m.ServiceProvider.DefaultRedirectURI, http.StatusFound)
+}
+
 // RequireAccount is HTTP middleware that requires that each request be
 // associated with a valid session. If the request is not associated with a valid
 // session, then rather than serve the request, the middleware redirects the user
@@ -122,24 +187,6 @@ func (m *Middleware) RequireAccount(handler http.Handler) http.Handler {
 
 		m.OnError(w, r, err)
 	})
-}
-
-func (m *Middleware) postHeader(w http.ResponseWriter) {
-	w.Header().Add("Content-Security-Policy", "default-src; "+
-		"script-src 'sha256-AjPdJSbZmeWHnEc5ykvJFay8FTWeTeRbs9dutfZ0HqE='; "+
-		"reflected-xss block; referrer no-referrer;")
-	w.Header().Add("Content-type", "text/html")
-}
-
-func (m *Middleware) postBody(w http.ResponseWriter, data []byte) {
-	var buf bytes.Buffer
-	buf.WriteString(`<!DOCTYPE html><html><body>`)
-	buf.Write(data)
-	buf.WriteString(`</body></html>`)
-	if _, err := w.Write(buf.Bytes()); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
 }
 
 // HandleStartAuthFlow is called to start the SAML authentication process.
@@ -181,53 +228,123 @@ func (m *Middleware) HandleStartAuthFlow(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	if binding == saml.HTTPRedirectBinding {
-		redirectURL, err := authReq.Redirect(relayState, &m.ServiceProvider)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		w.Header().Add("Location", redirectURL.String())
-		w.WriteHeader(http.StatusFound)
-		return
-	}
-	if binding == saml.HTTPPostBinding {
-		m.postHeader(w)
-		m.postBody(w, authReq.Post(relayState))
-		return
-	}
-	panic("not reached")
+	m.HTTPHandler(w, binding, relayState, authReq)
 }
 
-// CreateSessionFromAssertion is invoked by ServeHTTP when we have a new, valid SAML assertion.
-func (m *Middleware) CreateSessionFromAssertion(w http.ResponseWriter, r *http.Request, assertion *saml.Assertion, redirectURI string) {
-	if trackedRequestIndex := r.Form.Get("RelayState"); trackedRequestIndex != "" {
-		trackedRequest, err := m.RequestTracker.GetTrackedRequest(r, trackedRequestIndex)
-		if err != nil {
-			if errors.Is(err, http.ErrNoCookie) && m.ServiceProvider.AllowIDPInitiated {
-				if uri := r.Form.Get("RelayState"); uri != "" {
-					redirectURI = uri
-				}
-			} else {
-				m.OnError(w, r, err)
-				return
-			}
-		} else {
-			if err := m.RequestTracker.StopTrackingRequest(w, r, trackedRequestIndex); err != nil {
-				m.OnError(w, r, err)
-				return
-			}
-
-			redirectURI = trackedRequest.URI
+// TryLogout ...
+func (m *Middleware) TryLogout(handler http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		session, err := m.Session.GetSession(r)
+		if session != nil {
+			r = r.WithContext(ContextWithSession(r.Context(), session))
+			handler.ServeHTTP(w, r)
+			m.HandleStartLogoutFlow(w, r)
+			return
 		}
+		if errors.Is(err, ErrNoSession) {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		m.OnError(w, r, err)
+	})
+}
+
+// HandleStartLogoutFlow is called to start the SAML logout process.
+func (m *Middleware) HandleStartLogoutFlow(w http.ResponseWriter, r *http.Request) {
+	// If we try to redirect when the original request is the ACS URL we'll
+	// end up in a loop. This is a programming error, so we panic here. In
+	// general this means a 500 to the user, which is preferable to a
+	// redirect loop.
+	if r.URL.Path == m.ServiceProvider.SloURL.Path {
+		panic("don't wrap Middleware with TryLogout")
 	}
 
-	if err := m.Session.CreateSession(w, r, assertion); err != nil {
-		m.OnError(w, r, err)
+	session := SessionFromContext(r.Context())
+	if session == nil {
 		return
 	}
 
-	http.Redirect(w, r, redirectURI, http.StatusFound)
+	var nameID string
+	if nameIDSession, ok := session.(SessionWithNameID); ok {
+		nameID = nameIDSession.GetNameID()
+	}
+
+	var binding, bindingLocation string
+	if m.Binding != "" {
+		binding = m.Binding
+		bindingLocation = m.ServiceProvider.GetSLOBindingLocation(binding)
+	} else {
+		binding = saml.HTTPRedirectBinding
+		bindingLocation = m.ServiceProvider.GetSLOBindingLocation(binding)
+		if bindingLocation == "" {
+			binding = saml.HTTPPostBinding
+			bindingLocation = m.ServiceProvider.GetSLOBindingLocation(binding)
+		}
+	}
+
+	sloReq, err := m.ServiceProvider.MakeLogoutRequest(bindingLocation, binding, nameID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// no need to track SLO request
+	m.HTTPHandler(w, binding, "", sloReq)
+}
+
+// HTTPHandler ...
+func (m *Middleware) HTTPHandler(w http.ResponseWriter, binding, relayState string, handler saml.HTTPHandler) {
+	var err error
+	switch binding {
+	case saml.HTTPRedirectBinding:
+		var redirectURL *url.URL
+		if redirectURL, err = handler.Redirect(relayState, &m.ServiceProvider); err == nil {
+			m.RedirectHandler(w, redirectURL.String())
+			return
+		}
+
+	case saml.HTTPPostBinding:
+		var body []byte
+		if body, err = handler.Post(relayState); err == nil {
+			m.PostHandler(w, body)
+			return
+		}
+
+	default:
+		m.NotReachableHandler(w, binding)
+		return
+	}
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+}
+
+// RedirectHandler ...
+func (m *Middleware) RedirectHandler(w http.ResponseWriter, redirectURL string) {
+	w.Header().Add("Location", redirectURL)
+	w.WriteHeader(http.StatusFound)
+}
+
+// PostHandler ...
+func (m *Middleware) PostHandler(w http.ResponseWriter, data []byte) {
+	w.Header().Add("Content-Security-Policy", "default-src; "+
+		"script-src 'sha256-AjPdJSbZmeWHnEc5ykvJFay8FTWeTeRbs9dutfZ0HqE='; "+
+		"reflected-xss block; referrer no-referrer;")
+	w.Header().Add("Content-type", "text/html")
+
+	var buf bytes.Buffer
+	buf.WriteString(`<!DOCTYPE html><html><body>`)
+	buf.Write(data)
+	buf.WriteString(`</body></html>`)
+	if _, err := w.Write(buf.Bytes()); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+}
+
+// NotReachableHandler ...
+func (m *Middleware) NotReachableHandler(w http.ResponseWriter, msg string) {
+	http.Error(w, "not reachable: "+msg, http.StatusBadRequest)
 }
 
 // RequireAttribute returns a middleware function that requires that the
